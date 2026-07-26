@@ -1,0 +1,44 @@
+name: CFFEX 股指期货每日收盘价
+
+# 触发条件：
+# 1. 定时：每个交易日 15:15 CST（= 07:15 UTC，周一至周五）
+# 2. 手动：workflow_dispatch
+on:
+  schedule:
+    - cron: '15 7 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  fetch-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Fetch data and push to WeChat
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: |
+          python scripts/push_serverchan.py
+
+      - name: Upload Excel artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cffex-daily-${{ github.run_id }}
+          path: |
+            *.xlsx
+            data/*.xlsx
+          if-no-files-found: ignore
+          retention-days: 90
