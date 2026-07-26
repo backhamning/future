@@ -85,11 +85,35 @@ Python: C:/Users/LN/.workbuddy/binaries/python/envs/default/Scripts/python.exe
 4. Excel 单日文件作为 artifact 上传（保留 90 天）
 
 文件清单：
+- `scripts/fetch_close_prices.py` — 核心数据采集（支持 --json/--csv/--excel）
 - `scripts/push_serverchan.py` — Server酱推送脚本
+- `scripts/publish_draft.py` — 微信公众号草稿箱推送脚本
+- `scripts/export_history.py` — 历史数据导出为 Excel
 - `.github/workflows/cffex-daily.yml` — GitHub Actions 配置
 - `requirements.txt` — Python 依赖（akshare, pandas, openpyxl）
 - `DEPLOY.md` — 部署指南
 
+### 本地推送公众号草稿箱
+
+本地 WorkBuddy 自动化可在生成 Excel 的同时，将格式化结果推送到个人公众号草稿箱。
+
+```
+Python: venv Python
+任务: 运行 scripts/publish_draft.py --excel --excel-file <数据目录>/cffex_daily.xlsx
+调度: 每个交易日 15:15（与 Excel 累积任务串联或独立执行）
+```
+
+前置条件：
+1. 公众号后台获取 AppID/AppSecret（mp.weixin.qq.com → 开发 → 基本配置）
+2. 将本机公网 IP 添加至 IP 白名单（`curl ifconfig.me` 查看）
+3. 设置环境变量 `WECHAT_APP_ID` 和 `WECHAT_APP_SECRET`
+
+操作步骤：
+1. 自动化运行后，草稿自动出现在 mp.weixin.qq.com → 草稿箱
+2. 手动点"发布"即可
+
 环境变量：
 - `SERVERCHAN_SENDKEY`（必填）— Server酱 SendKey
 - `EXCEL_FILE`（可选）— Excel 输出路径
+- `WECHAT_APP_ID`（可选）— 公众号 AppID，用于草稿箱推送
+- `WECHAT_APP_SECRET`（可选）— 公众号 AppSecret，用于草稿箱推送
