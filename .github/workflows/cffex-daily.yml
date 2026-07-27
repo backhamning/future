@@ -1,11 +1,11 @@
 name: CFFEX 股指期货每日收盘价
 
 # 触发条件：
-# 1. 定时：每个交易日 15:15 CST（= 07:15 UTC，周一至周五）
+# 1. 定时：每个交易日 15:01 CST（= 07:01 UTC，周一至周五）
 # 2. 手动：workflow_dispatch
 on:
   schedule:
-    - cron: '15 7 * * 1-5'
+    - cron: '1 7 * * 1-5'
   workflow_dispatch:
 
 jobs:
