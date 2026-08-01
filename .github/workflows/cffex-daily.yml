@@ -26,7 +26,16 @@ jobs:
         run: |
           pip install --no-cache-dir -r requirements.txt
 
-      - name: Fetch data and push to WeChat
+      - name: Fetch data and send email
+        env:
+          QQ_EMAIL_ACCOUNT: ${{ secrets.QQ_EMAIL_ACCOUNT }}
+          QQ_EMAIL_AUTH_CODE: ${{ secrets.QQ_EMAIL_AUTH_CODE }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          python scripts/daily_collect_email.py --excel-file cffex_daily.xlsx
+
+      - name: Push to WeChat (Server酱, legacy)
+        continue-on-error: true
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
         run: |

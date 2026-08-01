@@ -37,6 +37,7 @@ from fetch_close_prices import (
 
 TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/token"
 DRAFT_URL = "https://api.weixin.qq.com/cgi-bin/draft/add"
+MATERIAL_URL = "https://api.weixin.qq.com/cgi-bin/material/add_material"
 
 
 def get_access_token(appid, secret):
@@ -71,11 +72,66 @@ def get_access_token(appid, secret):
     raise RuntimeError(msg)
 
 
-def add_draft(token, title, html_content):
+def _generate_cover_png():
+    """生成一张极简封面图（纯色 900x500 PNG），返回字节。"""
+    import struct
+    import zlib
+
+    width, height = 900, 500
+    # 深蓝背景 #2c3e50
+    r, g, b = 0x2c, 0x3e, 0x50
+
+    def chunk(ctype, data):
+        c = ctype + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    # PNG signature
+    sig = b"\x89PNG\r\n\x1a\n"
+    # IHDR
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    # IDAT: raw scanlines
+    raw = b""
+    for y in range(height):
+        raw += b"\x00"  # filter none
+        raw += bytes([r, g, b]) * width
+    idat = zlib.compress(raw)
+
+    return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def upload_cover(token):
+    """上传封面图作为永久素材，返回 media_id。"""
+    png_bytes = _generate_cover_png()
+
+    boundary = "----WorkBuddyCFFEXCover"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="media"; filename="cover.png"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode("utf-8") + png_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    url = f"{MATERIAL_URL}?access_token={token}&type=image"
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Content-Length", str(len(body)))
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+
+    if "media_id" in result:
+        return result["media_id"]
+
+    errcode = result.get("errcode", -1)
+    errmsg = result.get("errmsg", "未知错误")
+    raise RuntimeError(f"上传封面失败 [{errcode}]: {errmsg}")
+
+
+def add_draft(token, title, html_content, thumb_media_id):
     """向草稿箱添加一篇草稿。返回 media_id。"""
     data = json.dumps({
         "articles": [{
             "title": title,
+            "thumb_media_id": thumb_media_id,
             "content": html_content,
         }]
     }, ensure_ascii=False).encode("utf-8")
@@ -236,7 +292,7 @@ def main():
             excel_file = sys.argv[i + 1]
 
     # 获取数据
-    print("[1/4] 获取期货数据...")
+    print("[1/5] 获取期货数据...")
     results = fetch_all()
     if not results:
         print("[INFO] 未获取到数据，可能非交易日")
@@ -244,7 +300,7 @@ def main():
 
     print(f"      获取到 {len(results)} 个合约")
 
-    print("[2/4] 获取 ETF 数据...")
+    print("[2/5] 获取 ETF 数据...")
     etf_data = fetch_etf_close()
     etf_count = len(etf_data) if etf_data else 0
     print(f"      获取到 {etf_count} 只 ETF")
@@ -255,15 +311,20 @@ def main():
         save_excel(results, etf_data, excel_file)
 
     # 格式化
-    print("[3/4] 格式化为微信 HTML...")
+    print("[3/5] 格式化为微信 HTML...")
     html, trade_date = format_html(results, etf_data)
     title = f"CFFEX 股指期货收盘 {trade_date}"
 
-    # 获取 token 并推送
-    print("[4/4] 推送到公众号草稿箱...")
+    # 获取 token
+    print("[4/5] 获取 access_token + 上传封面...")
     try:
         token = get_access_token(appid, secret)
-        media_id = add_draft(token, title, html)
+        thumb_id = upload_cover(token)
+        print(f"      封面 media_id: {thumb_id}")
+
+        # 推送草稿
+        print("[5/5] 推送到公众号草稿箱...")
+        media_id = add_draft(token, title, html, thumb_id)
         print(f"\n[OK] 草稿已创建!")
         print(f"     media_id: {media_id}")
         print(f"     标题: {title}")

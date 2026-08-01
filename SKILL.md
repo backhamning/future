@@ -13,9 +13,11 @@ agent_created: true
 
 ## Data Source
 
-**主数据源：akshare** (`futures_zh_daily_sina`) — 返回结构化 DataFrame，含完整 OHLCV + settle。
+**主数据源：akshare 实时接口** (`futures_zh_realtime`) — 返回当日实时行情，收盘后立即可取，一次拉整个品种所有合约。注意：结算价(settlement)在收盘后约16:00才公布，15:15时该字段为空。
 
-**备用数据源：新浪 HTTP 直连** — 当 akshare 未安装时自动回退，纯 Python 标准库，零外部依赖。
+**备用数据源 1：新浪 HTTP 直连** (`hq.sinajs.cn`) — 纯标准库，零外部依赖，当 akshare 不可用时自动回退。
+
+**备用数据源 2：akshare 日线接口** (`futures_zh_daily_sina`) — 返回历史日线数据，有 1-2 小时延迟，作为最终兜底。
 
 Python 环境：`C:/Users/LN/.workbuddy/binaries/python/envs/default/Scripts/python.exe`（安装了 akshare 1.18.78 的 venv）。
 
@@ -75,19 +77,27 @@ Python: C:/Users/LN/.workbuddy/binaries/python/envs/default/Scripts/python.exe
 输出: 累积 Excel 文件（汇总 sheet + 每日详情 sheet）
 ```
 
-### 云端自动化（GitHub Actions + Server酱 微信推送）
+### 云端自动化（GitHub Actions + 邮件发送）
 
 详见 `DEPLOY.md`。核心流程：
 
-1. GitHub Actions cron 每交易日 07:15 UTC（= 15:15 CST）触发
-2. 安装依赖 → 运行 `scripts/push_serverchan.py`
-3. 采集数据 → 格式化为 Markdown → POST 到 Server酱 → 推送到微信
-4. Excel 单日文件作为 artifact 上传（保留 90 天）
+1. GitHub Actions cron 每交易日 07:01 UTC（= 15:01 CST，周一至周五）触发
+2. 安装依赖 → 运行 `scripts/daily_collect_email.py --excel-file cffex_daily.xlsx`
+3. 采集期货 + ETF 数据 → 生成 HTML 邮件 → SMTP 发送到 QQ 邮箱（凭据存于仓库 Secrets）
+4. Server酱微信推送作为遗留步骤保留（`push_serverchan.py`，失败不阻断邮件）
+5. 当日 Excel 作为 artifact 上传（保留 90 天）
+
+所需 Secrets：
+- `QQ_EMAIL_ACCOUNT` — QQ 邮箱账号
+- `QQ_EMAIL_AUTH_CODE` — QQ 邮箱授权码
+- `EMAIL_TO` — 收件人（可选，默认同账号）
+- `SERVERCHAN_SENDKEY` — Server酱推送（遗留，可选）
 
 文件清单：
 - `scripts/fetch_close_prices.py` — 核心数据采集（支持 --json/--csv/--excel）
-- `scripts/push_serverchan.py` — Server酱推送脚本
-- `scripts/publish_draft.py` — 微信公众号草稿箱推送脚本
+- `scripts/daily_collect_email.py` — 采集 + 生成 HTML 邮件 + SMTP 发送
+- `scripts/push_serverchan.py` — Server酱推送脚本（遗留）
+- `scripts/publish_draft.py` — 微信公众号草稿箱推送脚本（遗留）
 - `scripts/export_history.py` — 历史数据导出为 Excel
 - `.github/workflows/cffex-daily.yml` — GitHub Actions 配置
 - `requirements.txt` — Python 依赖（akshare, pandas, openpyxl）

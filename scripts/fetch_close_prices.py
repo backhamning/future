@@ -74,7 +74,16 @@ def gen_contract_codes(year, month, months_ahead=CONTRACT_MONTHS_AHEAD):
     return codes
 
 
-# ── 数据获取：akshare（主） ─────────────────────────────────────
+# ── 数据获取：akshare 实时 ──────────────────────────────────────
+
+
+# akshare 实时接口品种名映射（中文品种名 → 代码前缀）
+AKSHARE_REALTIME_SYMBOLS = {
+    "IH": "上证50指数期货",
+    "IF": "沪深300指数期货",
+    "IC": "中证500指数期货",
+    "IM": "中证1000股指期货",
+}
 
 
 def _has_akshare():
@@ -86,9 +95,75 @@ def _has_akshare():
         return False
 
 
-def fetch_via_akshare(codes):
+def fetch_via_akshare_realtime():
     """
-    通过 akshare 逐合约获取日线数据，取最新一条。
+    通过 akshare futures_zh_realtime 获取各品种全部活跃合约的实时行情。
+
+    优点：返回当日数据（收盘后立即可取），一次拉一个品种所有合约。
+    限制：settlement 列在收盘后约 16:00 才有值，15:15 时为 0。
+
+    Returns:
+        list[dict]
+    """
+    import akshare as ak
+
+    results = []
+    for inst, cn_name in AKSHARE_REALTIME_SYMBOLS.items():
+        try:
+            df = ak.futures_zh_realtime(symbol=cn_name)
+            if df is None or df.empty:
+                continue
+
+            for _, row in df.iterrows():
+                symbol = str(row.get("symbol", ""))
+                # 过滤连续合约（如 IH0, IF0），它是当月合约镜像
+                if symbol.endswith("0") or len(symbol) <= 4:
+                    continue
+
+                code = symbol  # e.g. "IH2608"
+                month = code[2:]  # e.g. "2608"
+
+                close = _safe_float(row.get("close"))
+                volume = _safe_int(row.get("volume"))
+
+                if close is None or volume is None or volume == 0:
+                    continue
+
+                settle = _safe_float(row.get("settlement"))
+                # settlement 在收盘后不久为 0，用 presettlement 标记"待更新"
+                if settle is not None and settle == 0.0:
+                    settle = None
+
+                record = {
+                    "code": code,
+                    "instrument": inst,
+                    "month": month,
+                    "name": str(row.get("name", "")),
+                    "trade_date": str(row.get("tradedate", "")),
+                    "open": _safe_float(row.get("open")),
+                    "high": _safe_float(row.get("high")),
+                    "low": _safe_float(row.get("low")),
+                    "close": close,
+                    "volume": volume,
+                    "amount": None,
+                    "open_interest": _safe_int(row.get("position")),
+                    "settle": settle,
+                    "source": "akshare_realtime",
+                }
+
+                results.append(record)
+
+        except Exception as e:
+            print(f"[WARN] akshare realtime 获取 {inst} 失败: {e}", file=sys.stderr)
+
+    return results
+
+
+def fetch_via_akshare_daily(codes):
+    """
+    通过 akshare futures_zh_daily_sina 逐合约获取日线数据，取最新一条。
+
+    注意：此接口数据更新有延迟（收盘后 1-2 小时），15:15 时通常只有前一交易日数据。
 
     Returns:
         list[dict]
@@ -100,7 +175,6 @@ def fetch_via_akshare(codes):
         try:
             df = ak.futures_zh_daily_sina(symbol=code)
 
-            # 空 DataFrame（合约不存在）静默跳过
             if df is None or (hasattr(df, "empty") and df.empty):
                 continue
 
@@ -119,20 +193,18 @@ def fetch_via_akshare(codes):
                 "amount": None,
                 "open_interest": _safe_int(row.get("hold")),
                 "settle": _safe_float(row.get("settle")),
-                "source": "akshare",
+                "source": "akshare_daily",
             }
 
-            # 过滤无效数据
             if record["close"] is None or record["volume"] is None or record["volume"] == 0:
                 continue
 
             results.append(record)
 
         except ValueError:
-            # 合约不存在（akshare 返回空 DataFrame 时抛 ValueError），静默跳过
             continue
         except Exception as e:
-            print(f"[WARN] akshare 获取 {code} 失败: {e}", file=sys.stderr)
+            print(f"[WARN] akshare daily 获取 {code} 失败: {e}", file=sys.stderr)
 
     return results
 
@@ -286,27 +358,41 @@ def fetch_via_sina(codes, batch_size=40):
 
 
 def fetch_all():
-    """获取所有活跃合约数据。优先用 akshare，不可用时回退到 Sina HTTP。"""
-    today = date.today()
-    codes = gen_contract_codes(today.year, today.month)
-
-    # 也查上个月（刚交割完的合约可能还有最后交易日数据）
-    pm = today.month - 1
-    py = today.year
-    if pm <= 0:
-        pm = 12
-        py -= 1
-    codes.extend(gen_contract_codes(py, pm, 1))
-
-    # 去重
-    codes = list(dict.fromkeys(codes))
-
-    # 选择数据源
+    """获取所有活跃合约数据。优先级：akshare realtime → Sina HTTP → akshare daily。"""
+    # 第一优先：akshare realtime（实时行情，收盘后立即可取，一次拉整个品种）
+    results = []
     if _has_akshare():
-        results = fetch_via_akshare(codes)
-    else:
-        print("[INFO] akshare 未安装，使用新浪 HTTP 直连", file=sys.stderr)
+        results = fetch_via_akshare_realtime()
+
+    # 第二优先：Sina HTTP（纯标准库，零外部依赖）
+    if not results:
+        today = date.today()
+        codes = gen_contract_codes(today.year, today.month)
+        pm = today.month - 1
+        py = today.year
+        if pm <= 0:
+            pm = 12
+            py -= 1
+        codes.extend(gen_contract_codes(py, pm, 1))
+        codes = list(dict.fromkeys(codes))
+
+        print("[INFO] akshare realtime 无数据，回退到 Sina HTTP", file=sys.stderr)
         results = fetch_via_sina(codes)
+
+    # 第三优先：akshare daily（延迟数据，收盘后 1-2 小时才有）
+    if not results and _has_akshare():
+        today = date.today()
+        codes = gen_contract_codes(today.year, today.month)
+        pm = today.month - 1
+        py = today.year
+        if pm <= 0:
+            pm = 12
+            py -= 1
+        codes.extend(gen_contract_codes(py, pm, 1))
+        codes = list(dict.fromkeys(codes))
+
+        print("[INFO] akshare realtime 和 Sina HTTP 均无数据，回退到 akshare daily", file=sys.stderr)
+        results = fetch_via_akshare_daily(codes)
 
     # 去重
     seen = set()
@@ -366,7 +452,7 @@ def format_table(results, etf_data=None):
 
     # 数据源标记
     src = results[0].get("source", "") if results else ""
-    src_label = "akshare" if src == "akshare" else "新浪 HTTP"
+    src_label = "akshare 实时" if src == "akshare_realtime" else ("akshare 日线" if src == "akshare_daily" else "新浪 HTTP")
 
     grouped = {}
     for r in results:
