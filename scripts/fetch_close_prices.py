@@ -126,7 +126,8 @@ def fetch_via_akshare_realtime():
                 close = _safe_float(row.get("close"))
                 volume = _safe_int(row.get("volume"))
 
-                if close is None or volume is None or volume == 0:
+                # 过滤无效数据：close 为 None 或 0（收盘瞬间 akshare 可能返回 0）
+                if close is None or close == 0 or volume is None or volume == 0:
                     continue
 
                 settle = _safe_float(row.get("settlement"))
@@ -216,7 +217,7 @@ def fetch_etf_close():
     """
     获取 IH/IF/IC/IM 对应 ETF 的最新收盘价。
 
-    优先用 Sina HTTP（快速），akshare 作 fallback。
+    仅用 Sina HTTP（东方财富已弃用，不做回退）。
 
     Returns:
         dict: {instrument: {"code": "510050", "name": "上证50ETF", "close": 3.050}, ...}
@@ -255,28 +256,6 @@ def fetch_etf_close():
             }
     except Exception:
         pass
-
-    # 如果 Sina 没拿到数据，尝试 akshare
-    if not etf_data and _has_akshare():
-        try:
-            import akshare as ak
-            for inst, (code, name) in INSTRUMENT_ETF.items():
-                try:
-                    df = ak.fund_etf_hist_em(
-                        symbol=code, period="daily", adjust="",
-                    )
-                    if df is not None and not df.empty:
-                        latest = df.iloc[-1]
-                        etf_data[inst] = {
-                            "code": code,
-                            "name": name,
-                            "close": _safe_float(latest.get("收盘")),
-                            "date": str(latest.get("日期", "")),
-                        }
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
     return etf_data
 
@@ -364,8 +343,12 @@ def fetch_all():
     if _has_akshare():
         results = fetch_via_akshare_realtime()
 
-    # 第二优先：Sina HTTP（纯标准库，零外部依赖）
-    if not results:
+    # 检查是否有品种缺失（可能是 close=0 被过滤或数据源延迟）
+    present_insts = {r["instrument"] for r in results}
+    missing_insts = [inst for inst in INSTRUMENTS if inst not in present_insts]
+
+    # 第二优先：Sina HTTP 补充（无数据或有品种缺失时触发）
+    if missing_insts or not results:
         today = date.today()
         codes = gen_contract_codes(today.year, today.month)
         pm = today.month - 1
@@ -376,8 +359,17 @@ def fetch_all():
         codes.extend(gen_contract_codes(py, pm, 1))
         codes = list(dict.fromkeys(codes))
 
-        print("[INFO] akshare realtime 无数据，回退到 Sina HTTP", file=sys.stderr)
-        results = fetch_via_sina(codes)
+        if not results:
+            print("[INFO] akshare realtime 无数据，回退到 Sina HTTP", file=sys.stderr)
+        else:
+            print(f"[INFO] akshare realtime 缺少品种 {missing_insts}，用 Sina HTTP 补充", file=sys.stderr)
+
+        sina_results = fetch_via_sina(codes)
+        # 合并：只添加 results 中不存在的合约
+        existing_codes = {r["code"] for r in results}
+        for r in sina_results:
+            if r["code"] not in existing_codes:
+                results.append(r)
 
     # 第三优先：akshare daily（延迟数据，收盘后 1-2 小时才有）
     if not results and _has_akshare():

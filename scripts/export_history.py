@@ -420,111 +420,107 @@ def build_etf_sheet(wb, start_date, end_date, create_sheet=True):
         "512100": "IM_中证1000ETF",
     }
 
-    if _has_akshare():
-        import akshare as ak  # noqa: F811
-    else:
-        if ws is not None:
-            ws.cell(row=1, column=1, value="需要 akshare")
-        return ws, {}
-
     all_dates = set()
     etf_data = {}
     for code, name in etf_map.items():
         df = None
 
-        # 主: akshare fund_etf_hist_em（收盘后即时可用，需 YYYYMMDD 格式）
+        # 新浪 K 线接口（唯一 ETF 数据源；东方财富 push2his 已弃用/封锁）
         try:
-            if _has_akshare():
-                import akshare as ak
-                s = start_date.replace("-", "")
-                e = end_date.replace("-", "")
-                df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=s, end_date=e, adjust="")
-                if df is not None and not df.empty:
-                    df = df.rename(columns={"日期": "date", "收盘": "close"})
-                    df["date"] = df["date"].astype(str)
+            from urllib.request import Request, urlopen
+            import json as _json
+            import pandas as pd
+
+            sina_code = f"sh{code}"
+            url = (
+                "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&ma=no&datalen=600"
+            )
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"})
+            with urlopen(req, timeout=15) as resp:
+                raw = _json.loads(resp.read().decode())
+
+            rows = []
+            for item in raw:
+                d = item.get("day", "")
+                if start_date <= d <= end_date:
+                    rows.append({
+                        "date": d,
+                        "close": float(item["close"]),
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "volume": float(item["volume"]),
+                    })
+            if rows:
+                df = pd.DataFrame(rows)
         except Exception:
             pass
-
-        # 备: 新浪 K 线接口（稳定但不一定有当天数据）
-        if df is None or df.empty:
-            try:
-                from urllib.request import Request, urlopen
-                import json as _json
-
-                sina_code = f"sh{code}"
-                url = (
-                    "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-                    f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&ma=no&datalen=200"
-                )
-                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urlopen(req, timeout=15) as resp:
-                    raw = _json.loads(resp.read().decode())
-
-                rows = []
-                for item in raw:
-                    d = item.get("day", "")
-                    if start_date <= d <= end_date:
-                        rows.append({
-                            "date": d,
-                            "close": float(item["close"]),
-                            "open": float(item["open"]),
-                            "high": float(item["high"]),
-                            "low": float(item["low"]),
-                            "volume": float(item["volume"]),
-                        })
-                if rows:
-                    import pandas as pd
-                    df = pd.DataFrame(rows)
-            except Exception:
-                pass
 
         if df is not None and not df.empty:
             all_dates.update(df["date"].tolist())
             etf_data[code] = df.set_index("date")
             print(f"  [OK] ETF {code} ({name}): {len(df)} 条 ({df['date'].iloc[0]} ~ {df['date'].iloc[-1]})")
         else:
-            print(f"  [ERR] ETF {code}: 所有数据源均失败")
+            print(f"  [ERR] ETF {code}: 新浪 K 线获取失败")
 
-    # 补充当日 ETF 数据：fund_etf_hist_em 收盘后延迟较长，用 Sina 实时行情补
+    # 补充当日 ETF 数据：
+    # 新浪 K 线可能不含当日（收盘前拉取），用 Sina 实时行情补（仅当日，>0 才采用）。
     from datetime import date as _dt
     today_str = _dt.today().strftime("%Y-%m-%d")
-    if today_str not in all_dates:
+
+    def _today_etf_close_ok(code):
+        if code not in etf_data or etf_data[code] is None or etf_data[code].empty:
+            return False
+        if today_str not in etf_data[code].index:
+            return False
         try:
-            from urllib.request import Request, urlopen
-            sina_map = {"510050": "sh510050", "510300": "sh510300", "510500": "sh510500", "512100": "sh512100"}
-            url = "https://hq.sinajs.cn/list=" + ",".join(sina_map.values())
+            v = float(etf_data[code].loc[today_str, "close"])
+        except Exception:
+            return False
+        return v > 0
+
+    try:
+        from urllib.request import Request, urlopen
+        import re
+        import pandas as pd
+        sina_map = {"510050": "sh510050", "510300": "sh510300", "510500": "sh510500", "512100": "sh512100"}
+        name = {"510050": "IH_上证50ETF", "510300": "IF_沪深300ETF", "510500": "IC_中证500ETF", "512100": "IM_中证1000ETF"}
+        # 仅对当日收盘无效的 ETF 补 Sina 实时（缺失 / 0 占位都补）
+        need = [c for c in sina_map if not _today_etf_close_ok(c)]
+        if need:
+            url = "https://hq.sinajs.cn/list=" + ",".join(sina_map[c] for c in need)
             req = Request(url, headers={"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=15) as resp:
                 text = resp.read().decode("gbk", errors="replace")
-            import re
             rev = {v: k for k, v in sina_map.items()}
-            import pandas as pd
             for m in re.finditer(r'var hq_str_(\w+)="([^"]*)"', text):
                 s_code = m.group(1)
                 if s_code not in rev:
                     continue
+                etf_code = rev[s_code]
+                if etf_code not in need:
+                    continue
                 vals = m.group(2).split(",")
                 if len(vals) < 4:
                     continue
-                etf_code = rev[s_code]
                 try:
                     close_v = float(vals[3])
                 except (ValueError, TypeError):
                     continue
                 if close_v <= 0:
                     continue
+                new_row = pd.DataFrame([{"date": today_str, "close": close_v, "open": close_v, "high": close_v, "low": close_v, "volume": 0}]).set_index("date")
                 if etf_code not in etf_data or etf_data[etf_code] is None or etf_data[etf_code].empty:
-                    new_df = pd.DataFrame([{"date": today_str, "close": close_v}]).set_index("date")
-                    etf_data[etf_code] = new_df
+                    etf_data[etf_code] = new_row
                 else:
-                    # 追加到现有 DataFrame
-                    new_row = pd.DataFrame([{"date": today_str, "close": close_v, "open": close_v, "high": close_v, "low": close_v, "volume": 0}]).set_index("date")
+                    # 丢弃当日旧值，用 Sina 实时覆盖当日
+                    etf_data[etf_code] = etf_data[etf_code][etf_data[etf_code].index != today_str]
                     etf_data[etf_code] = pd.concat([etf_data[etf_code], new_row])
                 all_dates.add(today_str)
-                name = {"510050": "IH_上证50ETF", "510300": "IF_沪深300ETF", "510500": "IC_中证500ETF", "512100": "IM_中证1000ETF"}
-                print(f"  [+] ETF {etf_code} ({name.get(etf_code, '')}): 补充当日 {today_str} (Sina realtime) close={close_v}")
-        except Exception as e:
-            print(f"  [!] ETF 当日补丁失败: {e}")
+                print(f"  [+] ETF {etf_code} ({name.get(etf_code, '')}): 补充/修正当日 {today_str} (Sina realtime) close={close_v}")
+    except Exception as e:
+        print(f"  [!] ETF 当日补丁失败: {e}")
 
     all_dates = sorted(all_dates)
 
