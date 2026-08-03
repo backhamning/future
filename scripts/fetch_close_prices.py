@@ -222,8 +222,6 @@ def fetch_etf_close():
     Returns:
         dict: {instrument: {"code": "510050", "name": "上证50ETF", "close": 3.050}, ...}
     """
-    etf_data = {}
-
     # Sina 代码映射
     sina_map = {
         "IH": "sh510050",
@@ -232,30 +230,44 @@ def fetch_etf_close():
         "IM": "sh512100",
     }
 
-    try:
-        from urllib.request import Request, urlopen
+    from urllib.request import Request, urlopen
+    import time
 
-        url = SINA_URL + ",".join(sina_map.values())
-        req = Request(url, headers=SINA_HEADERS)
-        with urlopen(req, timeout=15) as resp:
-            text = resp.read().decode("gbk", errors="replace")
+    url = SINA_URL + ",".join(sina_map.values())
+    rev = {v: k for k, v in sina_map.items()}
+    etf_data = {}
 
-        rev = {v: k for k, v in sina_map.items()}
-        for m in re.finditer(r'var hq_str_(\w+)="([^"]*)"', text):
-            sina_code = m.group(1)
-            vals = m.group(2).split(",")
-            if sina_code not in rev or len(vals) < 4:
-                continue
-            inst = rev[sina_code]
-            code, name = INSTRUMENT_ETF[inst]
-            etf_data[inst] = {
-                "code": code,
-                "name": name,
-                "close": float(vals[3]) if vals[3] and vals[3] != "" else None,
-                "date": vals[30].strip() if len(vals) > 30 else "",
-            }
-    except Exception:
-        pass
+    # GitHub Actions 上 Sina 实时接口常因限流返回空（导致 ETF 抓到 0 只），
+    # 重试最多 3 次（间隔 2 秒），集齐 4 只才收手，避免偶发限流污染数据。
+    for attempt in range(3):
+        try:
+            req = Request(url, headers=SINA_HEADERS)
+            with urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("gbk", errors="replace")
+
+            batch = {}
+            for m in re.finditer(r'var hq_str_(\w+)="([^"]*)"', text):
+                sina_code = m.group(1)
+                vals = m.group(2).split(",")
+                if sina_code not in rev or len(vals) < 4:
+                    continue
+                inst = rev[sina_code]
+                code, name = INSTRUMENT_ETF[inst]
+                batch[inst] = {
+                    "code": code,
+                    "name": name,
+                    "close": float(vals[3]) if vals[3] and vals[3] != "" else None,
+                    "date": vals[30].strip() if len(vals) > 30 else "",
+                }
+            if batch:
+                etf_data = batch
+            # 全部 4 只都拿到才视为成功
+            if len(etf_data) >= len(sina_map):
+                break
+        except Exception as e:
+            print(f"[WARN] ETF 实时获取第 {attempt + 1} 次失败: {e}", file=sys.stderr)
+        if attempt < 2:
+            time.sleep(2)
 
     return etf_data
 
