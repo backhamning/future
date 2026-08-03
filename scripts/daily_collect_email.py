@@ -116,6 +116,32 @@ def get_prev_close(code_map):
     return prev
 
 
+def _third_friday(year, month):
+    """返回某年某月的第三个周五（CFFEX 股指期货交割日）。"""
+    import datetime as _dt
+    first = _dt.date(year, month, 1)
+    # weekday(): Monday=0 ... Sunday=6；第一个周五 = 1 + (4 - 周一偏移) % 7
+    first_friday = 1 + (4 - first.weekday()) % 7
+    return _dt.date(year, month, first_friday + 14)
+
+
+def _delivery_date(month_code):
+    """合约月份代码（如 '2608'）对应的交割日 date 对象。"""
+    yy = 2000 + int(month_code[:2])
+    mm = int(month_code[2:])
+    return _third_friday(yy, mm)
+
+
+def days_between_deliveries(front_month, far_month):
+    """两个合约月份代码之间的交割日天数差（绝对值），用于年化跨期价差。"""
+    try:
+        d1 = _delivery_date(front_month)
+        d2 = _delivery_date(far_month)
+        return abs((d2 - d1).days)
+    except (ValueError, IndexError):
+        return None
+
+
 def build_html_body(results, etf_data):
     """生成 HTML 邮件正文。"""
     if not results:
@@ -150,7 +176,8 @@ def build_html_body(results, etf_data):
     # ── 概览表 ──
     parts.append('<table class="summary-table">'
                  '<tr><th class="col-left">品种</th><th>当月合约</th><th>收盘</th>'
-                 '<th>涨跌 / 涨跌幅</th><th>期货/ETF</th><th>价差结构</th></tr>')
+                 '<th>涨跌 / 涨跌幅</th><th>期货/ETF</th><th>价差结构</th>'
+                 '<th>贴水率</th><th>年化贴水率</th></tr>')
 
     for inst in ["IH", "IF", "IC", "IM"]:
         if inst not in grouped:
@@ -192,7 +219,10 @@ def build_html_body(results, etf_data):
         last = contracts[-1]
         structure_str = "--"
         structure_cls = ""
-        if front["close"] is not None and last["close"] is not None and len(contracts) > 1:
+        disc_str = "--"        # 贴水率（简单 %）
+        ann_str = "--"         # 年化贴水率（%）
+        rate_cls = ""
+        if front["close"] is not None and last["close"] is not None and len(contracts) > 1 and front["close"] > 0:
             diff = last["close"] - front["close"]
             if diff < 0:
                 structure_str = f"贴水 {abs(diff):.0f}"
@@ -203,6 +233,31 @@ def build_html_body(results, etf_data):
             else:
                 structure_str = "平水"
 
+            # 贴水率：以「当月 - 远月」为正（远月低于当月 = 贴水）
+            discount = front["close"] - last["close"]
+            disc_pct = discount / front["close"] * 100
+            if disc_pct > 0.005:
+                disc_str = f"贴水 {disc_pct:.2f}%"
+                rate_cls = "down"
+            elif disc_pct < -0.005:
+                disc_str = f"升水 {abs(disc_pct):.2f}%"
+                rate_cls = "up"
+            else:
+                disc_str = "平水"
+                rate_cls = "muted"
+
+            # 年化贴水率：跨期价差（远月-近月）须按「近月→远月」交割间隔折算，
+            # 不能用近月自身的剩余天数（那样会把 4 个月价差错误按 ~18 天摊到全年）。
+            dspan = days_between_deliveries(front["month"], last["month"])
+            if dspan and dspan > 0:
+                ann_pct = disc_pct * 365.0 / dspan
+                if ann_pct > 0.005:
+                    ann_str = f"贴水 {ann_pct:.2f}%"
+                elif ann_pct < -0.005:
+                    ann_str = f"升水 {abs(ann_pct):.2f}%"
+                else:
+                    ann_str = "平水"
+
         parts.append(
             f'<tr>'
             f'<td class="col-left inst-name">{inst}</td>'
@@ -211,6 +266,8 @@ def build_html_body(results, etf_data):
             f'<td class="{chg_cls}">{chg_sign}</td>'
             f'<td class="ratio-val">{ratio_str}</td>'
             f'<td class="{structure_cls}">{structure_str}</td>'
+            f'<td class="{rate_cls}">{disc_str}</td>'
+            f'<td class="{rate_cls}">{ann_str}</td>'
             f'</tr>'
         )
 
