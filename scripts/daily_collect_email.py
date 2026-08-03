@@ -75,6 +75,47 @@ EMAIL_CSS = """
 """
 
 
+def get_prev_close(code_map):
+    """
+    获取各品种当月合约的「昨收」（前一交易日收盘价），用于计算涨跌/涨跌幅。
+
+    来源：akshare futures_zh_daily_sina（新浪日线，仅读取历史收盘，符合只用 Sina 的约定）。
+    取 date < 今日 的最新一行收盘作为昨收。
+    返回 {instrument: 昨收(float)}；取不到时该品种不出现于字典。
+    """
+    prev = {}
+    try:
+        import akshare as ak
+        from datetime import date as _d
+        today_str = _d.today().strftime("%Y-%m-%d")
+        for inst, code in code_map.items():
+            try:
+                df = ak.futures_zh_daily_sina(symbol=code)
+                if df is None or getattr(df, "empty", True):
+                    continue
+                df = df.copy()
+                df["date"] = df["date"].astype(str)
+                prior = df[df["date"] < today_str]
+                if prior.empty:
+                    # 兜底：取倒数第二行（假设最后一行是今日）
+                    if len(df) >= 2:
+                        prior = df.iloc[[-2]]
+                    else:
+                        continue
+                row = prior.iloc[-1]
+                pc = row.get("close")
+                if pc is not None:
+                    try:
+                        prev[inst] = float(pc)
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return prev
+
+
 def build_html_body(results, etf_data):
     """生成 HTML 邮件正文。"""
     if not results:
@@ -94,6 +135,10 @@ def build_html_body(results, etf_data):
     for r in results:
         grouped.setdefault(r["instrument"], []).append(r)
 
+    # 取各品种当月合约代码，用于查询「昨收」
+    code_map = {inst: grouped[inst][0]["code"] for inst in grouped if grouped.get(inst)}
+    prev_close = get_prev_close(code_map)
+
     parts = [EMAIL_CSS]
     parts.append('<div class="container">')
 
@@ -105,7 +150,7 @@ def build_html_body(results, etf_data):
     # ── 概览表 ──
     parts.append('<table class="summary-table">'
                  '<tr><th class="col-left">品种</th><th>当月合约</th><th>收盘</th>'
-                 '<th>涨跌</th><th>期货/ETF</th><th>价差结构</th></tr>')
+                 '<th>涨跌 / 涨跌幅</th><th>期货/ETF</th><th>价差结构</th></tr>')
 
     for inst in ["IH", "IF", "IC", "IM"]:
         if inst not in grouped:
@@ -117,21 +162,23 @@ def build_html_body(results, etf_data):
 
         cls = f"{front['close']:.0f}" if front["close"] is not None else "--"
 
-        # 涨跌：用结算价 vs 收盘价判断方向
+        # 涨跌 / 涨跌幅：今收盘 - 昨收
         chg_sign = ""
         chg_cls = ""
-        if front.get("settle") is not None and front.get("close") is not None:
-            chg = front["close"] - front["settle"]
+        prev_c = prev_close.get(inst)
+        if front.get("close") is not None and prev_c:
+            chg = front["close"] - prev_c
+            pct = chg / prev_c * 100
             if chg > 0:
-                chg_sign = f'<span class="up">+{chg:.1f}</span>'
+                chg_sign = f'<span class="up">+{chg:.1f} (+{pct:.2f}%)</span>'
                 chg_cls = "up"
             elif chg < 0:
-                chg_sign = f'<span class="down">{chg:.1f}</span>'
+                chg_sign = f'<span class="down">{chg:.1f} ({pct:.2f}%)</span>'
                 chg_cls = "down"
             else:
-                chg_sign = '<span class="muted">0.0</span>'
+                chg_sign = '<span class="muted">0.0 (0.00%)</span>'
         elif front.get("close") is not None:
-            chg_sign = front["close"]
+            chg_sign = '<span class="muted">--</span>'
 
         # 期货/ETF 比率
         etf_close = etf_data.get(inst, {}).get("close")
