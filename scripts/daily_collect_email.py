@@ -401,6 +401,7 @@ def send_email(subject, html_body):
 
 def main():
     excel_file = None
+    no_email = "--no-email" in sys.argv
     for i, arg in enumerate(sys.argv):
         if arg == "--excel-file" and i + 1 < len(sys.argv):
             excel_file = sys.argv[i + 1]
@@ -438,10 +439,14 @@ def main():
             ratio_str = f"  比率={front['close']/etf_c:.1f}"
         print(f"      {inst} {name}: {c}{ratio_str}  ({len(inst_rows)}个合约)")
 
-    # 3. 发送邮件
+    # 3. 发送邮件（--no-email 时跳过，供本地自动化等不希望发信的场景使用）
     dates = [r.get("trade_date", "") for r in results if r.get("trade_date")]
     trade_date = max(dates) if dates else datetime.now().strftime("%Y-%m-%d")
     subject = f"CFFEX 股指期货收盘 {trade_date}"
+
+    if no_email:
+        print(f"\n[4/4] 跳过邮件发送（--no-email）")
+        return
 
     print(f"\n[4/4] 发送邮件...")
     send_email(subject, body)
