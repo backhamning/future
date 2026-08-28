@@ -116,8 +116,10 @@ def fetch_via_akshare_realtime():
 
             for _, row in df.iterrows():
                 symbol = str(row.get("symbol", ""))
-                # 过滤连续合约（如 IH0, IF0），它是当月合约镜像
-                if symbol.endswith("0") or len(symbol) <= 4:
+                # 过滤连续合约（如 IH0, IF0，长度<=4），它是当月合约镜像。
+                # 注意：不能用 symbol.endswith("0")，否则会把月份以 0 结尾的
+                # 合约（如 2610=10月、2710=10月）一并误删。
+                if len(symbol) <= 4:
                     continue
 
                 code = symbol  # e.g. "IH2608"
@@ -126,8 +128,11 @@ def fetch_via_akshare_realtime():
                 close = _safe_float(row.get("close"))
                 volume = _safe_int(row.get("volume"))
 
-                # 过滤无效数据：close 为 None 或 0（收盘瞬间 akshare 可能返回 0）
-                if close is None or close == 0 or volume is None or volume == 0:
+                # 过滤无效数据：仅丢弃无法定价的合约（close 缺失/为 0）。
+                # 注意：不要因 volume==0 丢弃——远季月/次月合约在盘前或成交清淡的
+                # 瞬时可能返回 volume=0，但它们有合法收盘价、属有效挂牌合约，
+                # 丢弃会导致"每品种 4 个合约"在某些时刻漏成 3 个。
+                if close is None or close == 0:
                     continue
 
                 settle = _safe_float(row.get("settlement"))
@@ -197,7 +202,9 @@ def fetch_via_akshare_daily(codes):
                 "source": "akshare_daily",
             }
 
-            if record["close"] is None or record["volume"] is None or record["volume"] == 0:
+            # 仅丢弃无法定价的合约（close 缺失/为 0）；volume==0 的远月合约仍有
+            # 合法收盘价，属有效挂牌合约，不应因此丢弃（与 realtime/Sina 路径一致）。
+            if record["close"] is None or record["close"] == 0:
                 continue
 
             results.append(record)
@@ -319,7 +326,10 @@ def fetch_via_sina(codes, batch_size=40):
                 close = _safe_float(vals[3])
                 volume = _safe_int(vals[4])
 
-                if close is None or volume is None or volume == 0:
+                # 仅丢弃无法定价的合约（close 缺失/为 0）；volume==0 的远月/次月
+                # 合约仍有合法收盘价，属有效挂牌合约，不应因成交量为 0 而丢弃
+                # （否则兜底路径也可能把每品种 4 个合约漏成 3 个）。
+                if close is None or close == 0:
                     continue
 
                 record = {

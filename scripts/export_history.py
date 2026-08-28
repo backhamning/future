@@ -9,7 +9,11 @@
 """
 
 import argparse
+import json
+import os
+import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 
 from openpyxl import Workbook
@@ -84,9 +88,63 @@ def gen_monthly_contracts(year, month, count):
     return codes
 
 
+def fetch_sina_futures_kline(symbol, start_date, end_date, max_retry=3):
+    """从新浪期货日 K 线获取合约历史。
+
+    akshare 的 futures_zh_daily_sina 当前对所有 CFFEX 股指期货代码稳定抛
+    IndexError（接口已不可用），改用新浪 InnerFuturesNewService.getDailyKLine。
+
+    字段映射（已验证）：o=今开 h=最高 l=最低 c=收盘 v=成交量 p=持仓 s=结算。
+    返回 DataFrame: date,open,high,low,close,volume,hold,settle（空则为空 DataFrame）。
+    新浪接口易限流，空结果/异常自动退避重试，避免把"限流空"误判为"无数据"。
+    """
+    import pandas as pd
+    import json as _json
+    import time
+    from urllib.request import Request, urlopen
+
+    url = (
+        "https://stock2.finance.sina.com.cn/futures/api/jsonp_v2.php/var%20_=/"
+        f"InnerFuturesNewService.getDailyKLine?symbol={symbol}"
+        f"&startDate={start_date}&endDate={end_date}"
+    )
+    for attempt in range(max_retry):
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"})
+            with urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("gbk", "replace")
+            s = text.find("(")
+            e = text.rfind(")")
+            arr = _json.loads(text[s + 1:e]) if s >= 0 and e > s else _json.loads(text)
+
+            rows = []
+            for it in arr:
+                d = str(it.get("d", ""))
+                if not d or not (start_date <= d <= end_date):
+                    continue
+                s_val = _safe_float(it.get("s"))
+                rows.append({
+                    "date": d,
+                    "open": _safe_float(it.get("o")),
+                    "high": _safe_float(it.get("h")),
+                    "low": _safe_float(it.get("l")),
+                    "close": _safe_float(it.get("c")),
+                    "volume": _safe_int(it.get("v")),
+                    "hold": _safe_int(it.get("p")),
+                    "settle": (s_val if s_val and s_val != 0 else None),
+                })
+            if rows:
+                return pd.DataFrame(rows)
+            # 空结果：多为限流，退避后重试
+        except Exception:
+            pass
+        if attempt < max_retry - 1:
+            time.sleep(1.0)
+    return pd.DataFrame()
+
+
 def discover_active_contracts(min_last_date=None):
     """查询并返回活跃的合约代码列表。"""
-    import akshare as ak
     from datetime import timedelta
 
     today = date.today()
@@ -96,18 +154,17 @@ def discover_active_contracts(min_last_date=None):
     # 确定需要覆盖的合约月份范围：从 min_last_date 所在月到 today + MONTH_RANGE
     min_y, min_m = int(min_last_date[:4]), int(min_last_date[:7].split("-")[1])
     months_back = (today.year - min_y) * 12 + (today.month - min_m)
-    total_months = months_back + MONTH_RANGE + 2  # +2 留裕量
+    total_months = months_back + MONTH_RANGE + 2  # +2 这个留裕量
     candidates = gen_monthly_contracts(min_y, min_m, total_months)
 
     active = set()
     for code in candidates:
         try:
-            df = ak.futures_zh_daily_sina(symbol=code)
+            # 用新浪期货 K 线判断合约是否在范围内有数据（akshare 日线已坏）
+            df = fetch_sina_futures_kline(code, min_last_date, today.isoformat())
             if df is None or df.empty:
                 continue
-            last_date = str(df.iloc[-1]["date"])
-            if last_date >= min_last_date:
-                active.add(code)
+            active.add(code)
         except Exception:
             pass
 
@@ -126,7 +183,8 @@ def fetch_all_history(contracts, start_date, end_date):
     all_data = {}  # {contract_code: DataFrame}
     for code in contracts:
         try:
-            df = ak.futures_zh_daily_sina(symbol=code)
+            # akshare futures_zh_daily_sina 已坏，改用新浪期货日 K 线
+            df = fetch_sina_futures_kline(code, start_date, end_date)
             if df is None or df.empty:
                 print(f"  [SKIP] {code}: 无数据")
                 continue
@@ -141,7 +199,10 @@ def fetch_all_history(contracts, start_date, end_date):
         except Exception as e:
             print(f"  [ERR] {code}: {e}")
 
-    # 补充当日数据：futures_zh_daily_sina 延迟 1-2 小时，用 realtime 补
+    # 补充当日数据：futures_zh_daily_sina 延迟 1-2 小时且对部分新合约（如 2609/2610）
+    # 会直接抛 IndexError，日线不可用；故用 realtime 补当日。
+    # 注意：日线失败的合约即使 realtime 有当日数据也必须补（新建记录），
+    # 否则"当月"合约（如 IC2609/IM2609）缺失会导致期货/ETF 比率错用远月。
     try:
         for inst, cn_name in RT_SYMBOLS.items():
             try:
@@ -150,17 +211,13 @@ def fetch_all_history(contracts, start_date, end_date):
                     continue
                 for _, row in rt.iterrows():
                     symbol = str(row.get("symbol", ""))
-                    if symbol.endswith("0") or len(symbol) <= 4:
-                        continue
-                    if symbol not in all_data:
+                    # 过滤连续合约（如 IH0，长度<=4）；不能用 endswith("0")，
+                    # 否则月份以 0 结尾的合约（如 2610=10月）会被误删。
+                    if len(symbol) <= 4:
                         continue
                     trade_date = str(row.get("tradedate", ""))
                     if not trade_date:
                         continue
-                    existing_dates = set(all_data[symbol]["date"].values)
-                    if trade_date in existing_dates:
-                        continue
-
                     close_v = _safe_float(row.get("close"))
                     volume_v = _safe_int(row.get("volume"))
                     if close_v is None or volume_v is None or volume_v == 0:
@@ -176,7 +233,15 @@ def fetch_all_history(contracts, start_date, end_date):
                         "hold": _safe_int(row.get("position")),
                         "settle": _safe_float(row.get("settlement")),
                     }])
-                    all_data[symbol] = pd.concat([all_data[symbol], new_row], ignore_index=True)
+
+                    if symbol in all_data:
+                        existing_dates = set(all_data[symbol]["date"].values)
+                        if trade_date in existing_dates:
+                            continue
+                        all_data[symbol] = pd.concat([all_data[symbol], new_row], ignore_index=True)
+                    else:
+                        # 日线缺失的新合约：用 realtime 当日数据新建
+                        all_data[symbol] = new_row
                     print(f"  [+] {symbol}: 补充当日 {trade_date} (realtime)")
             except Exception:
                 pass
@@ -565,6 +630,318 @@ def build_etf_sheet(wb, start_date, end_date, create_sheet=True):
     return ws, etf_data
 
 
+# ─────────────────────────────────────────────────────────────
+# ETF 期权历史 + 合成期货 F
+# ─────────────────────────────────────────────────────────────
+
+SINA_OPT_RT_REF = "https://finance.sina.com.cn/"
+SINA_OPT_HIST_REF = "https://stock.finance.sina.com.cn/option/quotes.html"
+
+# 合成期货 F = K + (C - P) 需要 ETF 期权行情。
+# 512100(IM/中证1000ETF) 在新浪期权体系无行情数据，IM 的合成F不可用，故跳过。
+_OPT_ETF_CODES = ["510050", "510300", "510500"]
+
+
+def _opt_get(url, ref, timeout=15):
+    from urllib.request import Request, urlopen
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": ref})
+    with urlopen(req, timeout=timeout) as r:
+        return r.read().decode("gbk", "replace")
+
+
+def _parse_opt_name(name):
+    """从合约简称解析 (行权价K, 类型)。如 '50ETF购7月2700' -> (2.7, 'C')。"""
+    if not name:
+        return None, None
+    typ = "C" if "购" in name else ("P" if ("沽" in name or "认沽" in name) else None)
+    if typ is None:
+        return None, None
+    m = re.search(r"(\d+)\s*$", name)
+    if not m:
+        return None, None
+    return float(m.group(1)) / 1000.0, typ
+
+
+def fetch_etf_option_history(start_date, end_date, max_retry=6):
+    """拉取 4 个 ETF 标的的期权历史日线。
+
+    返回 {etf_code: {contract_code: {"K": float, "type": "C"/"P", "df": DataFrame}}}。
+    合成期货 F = K + (C - P)，取每日最平值(ATM, K 最接近 ETF 收盘)的认购/认沽对计算。
+    """
+    import pandas as pd
+
+    s = date.fromisoformat(start_date)
+    e = date.fromisoformat(end_date)
+
+    # 期权 ETF 到期日 = 每月第 4 个周三。
+    # 只抓取在 [start, end] 内可能作为「当月合约」的期权月份：
+    #   - 从起始月（其到期日通常 >= start）
+    #   - 直到「到期日覆盖 end 的那个月」为止（更往后的月份在范围内永远不是当月，纯浪费）
+    def _opt_exp(yy, mm):
+        y = 2000 + yy
+        first = date(y, mm, 1)
+        days_to_first_wed = (2 - first.weekday()) % 7  # 周三 = 2
+        first_wed = first + timedelta(days=days_to_first_wed)
+        return first_wed + timedelta(days=21)  # 第 4 个周三
+
+    # 覆盖 end_date 所需的最晚期权月份（到期日 >= end 的那个月）
+    ey, em = e.year % 100, e.month
+    if _opt_exp(ey, em) < e:
+        em += 1
+        if em > 12:
+            em = 1
+            ey += 1
+
+    months = []
+    y, m = s.year, s.month
+    while True:
+        if (y % 100, m) > (ey, em):
+            break
+        months.append(f"{y % 100:02d}{m:02d}")
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+
+    # 取 ETF 当前收盘价（用于挑选平值 ATM 档），按 etf_code 缓存，整个函数只请求一次。
+    _ref_cache = {}
+    # 取 ETF 在 [start,end] 内逐日收盘序列（用于「逐日」挑选平值 ATM 档），按 etf_code 缓存。
+    _series_cache = {}
+
+    def _etf_ref_close(code):
+        if code in _ref_cache:
+            return _ref_cache[code]
+        price = None
+        try:
+            from urllib.request import Request, urlopen
+            import json as _json
+            sina_code = f"sh{code}"
+            url = (
+                "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&ma=no&datalen=5"
+            )
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"})
+            with urlopen(req, timeout=15) as resp:
+                raw = _json.loads(resp.read().decode())
+            if raw:
+                price = float(raw[-1].get("close", 0)) or None
+        except Exception:
+            price = None
+        _ref_cache[code] = price
+        return price
+
+    def _etf_close_series(code):
+        """取该 ETF 在 [start_date, end_date] 内逐日收盘序列 {date: close}，按 etf_code 缓存。"""
+        if code in _series_cache:
+            return _series_cache[code]
+        import json as _json
+        from urllib.request import Request, urlopen
+        sina_code = f"sh{code}"
+        url = (
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+            f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&ma=no&datalen=600"
+        )
+        out = {}
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"})
+            with urlopen(req, timeout=15) as resp:
+                arr = _json.loads(resp.read().decode())
+            for it in arr:
+                d = it.get("day", "")
+                if start_date <= d <= end_date:
+                    try:
+                        out[d] = float(it.get("close", 0))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            out = {}
+        _series_cache[code] = out
+        return out
+
+    def _front_month(d_str):
+        """给定交易日，返回 months 列表中「到期日 >= 该日」的最近月（与 _compute_synthetic_f 的当月口径一致）。"""
+        dd = date.fromisoformat(d_str)
+        for m in months:
+            if _opt_exp(int(m[:2]), int(m[2:])) >= dd:
+                return m
+        return months[-1] if months else None
+
+    opt_data = {}
+    for etf_code in _OPT_ETF_CODES:
+        contracts = {}
+        for mm in months:
+            for side, pre in [("C", "OP_UP"), ("P", "OP_DOWN")]:
+                # 1) 枚举该月该方向合约代码
+                codes = []
+                for attempt in range(max_retry):
+                    try:
+                        t = _opt_get(f"https://hq.sinajs.cn/list={pre}_{etf_code}{mm}", SINA_OPT_RT_REF)
+                        inner = t.split('"')[1] if '"' in t else ""
+                        if inner:
+                            codes = [c for c in inner.split(",") if c]
+                        if codes:
+                            break
+                    except Exception:
+                        if attempt == max_retry - 1:
+                            print(f"  [WARN] 枚举 {etf_code} {mm} {side} 失败")
+                    # 限流/空结果：退避后重试（不要直接 break 丢弃整月）
+                    if not codes and attempt < max_retry - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                if not codes:
+                    continue
+
+                # 2) 批量拿合约简称(含行权价/类型)，分批 50
+                meta = {}
+                for i in range(0, len(codes), 50):
+                    batch = codes[i:i + 50]
+                    ok = False
+                    for attempt in range(max_retry):
+                        try:
+                            t = _opt_get("https://hq.sinajs.cn/list=" + ",".join(batch), SINA_OPT_RT_REF)
+                            found_any = False
+                            for mt in re.finditer(r'var hq_str_(\w+)="([^"]*)"', t):
+                                name_field = None
+                                for fv in mt.group(2).split(","):
+                                    if "购" in fv or "沽" in fv or "认沽" in fv:
+                                        name_field = fv
+                                        break
+                                if name_field is None:
+                                    continue
+                                K, typ = _parse_opt_name(name_field)
+                                if K is not None:
+                                    meta[mt.group(1)] = (K, typ)
+                                    found_any = True
+                            if found_any:
+                                ok = True
+                                break
+                        except Exception:
+                            if attempt == max_retry - 1:
+                                print(f"  [WARN] 合约简称 {etf_code} {mm} 批量失败")
+                        # 限流/空结果：退避后重试，否则整批合约将丢失 meta 被跳过
+                        if not ok and attempt < max_retry - 1:
+                            time.sleep(1.5 * (attempt + 1))
+                    if not ok:
+                        print(f"  [WARN] 合约简称 {etf_code} {mm} 批量(空)")
+
+                # 2.5) 逐日挑选平值(ATM)档并只抓取这些档的日线（仍远少于全月）。
+                # ATM 行权价 = 当天「当月合约」行权价列表中、与当天 ETF 收盘最接近者（|K - 当天ETF价| 最小）。
+                # 关键改进：改为「逐交易日」选档 —— 现货在范围内漂移时，不同日期会锁定到不同平值档，
+                # 而不是用单一参考价（最新收盘）锁定一档套用全部日期。
+                # 由 Put-Call Parity，F=K+(C-P) 几乎与行权价无关（不同平值档 F 仅差千分之几），
+                # 故只抓 ATM 档即可，请求量远低于全月抓取。
+                # 仅对「当月为 mm」的那些日期计算 ATM，避免为远期月在无关日期浪费抓取。
+                if meta:
+                    ks = sorted({info[0] for info in meta.values()})
+                    series = _etf_close_series(etf_code)
+                    atm_set = set()
+                    if series:
+                        for d, price in series.items():
+                            if price is not None and _front_month(d) == mm:
+                                atm_set.add(min(ks, key=lambda k: abs(k - price)))
+                    if not atm_set:
+                        ref = _etf_ref_close(etf_code)
+                        atm_K = min(ks, key=lambda k: abs(k - ref)) if ref is not None else ks[len(ks) // 2]
+                        atm_set.add(atm_K)
+                    fetch_codes = [c for c in codes if c in meta and meta[c][0] in atm_set]
+                else:
+                    fetch_codes = []
+
+                # 3) 逐合约拉日线历史（仅 ATM 一对，由 _compute_synthetic_f 计算 F）
+                for ccode in fetch_codes:
+                    if ccode not in meta or ccode in contracts:
+                        continue
+                    K, typ = meta[ccode]
+                    df = None
+                    for attempt in range(max_retry):
+                        try:
+                            t = _opt_get(
+                                f"https://stock.finance.sina.com.cn/futures/api/jsonp_v2.php//StockOptionDaylineService.getSymbolInfo?symbol={ccode}",
+                                SINA_OPT_HIST_REF,
+                            )
+                            ss = t.find("(")
+                            ee = t.rfind(")")
+                            arr = json.loads(t[ss + 1:ee]) if ss >= 0 and ee > 0 else json.loads(t)
+                            rows = []
+                            for it in arr:
+                                d = it.get("d", "")
+                                if start_date <= d <= end_date:
+                                    try:
+                                        rows.append({"date": d, "close": float(it["c"])})
+                                    except (ValueError, KeyError):
+                                        pass
+                            if rows:
+                                df = pd.DataFrame(rows)
+                                break
+                            # rows 为空（Sina 限流常返回空数组）：退避后重试，不要丢弃合约
+                        except Exception:
+                            if attempt == max_retry - 1:
+                                print(f"  [WARN] 日线 {ccode} 失败")
+                        if df is None and attempt < max_retry - 1:
+                            time.sleep(1.5 * (attempt + 1))
+                    if df is not None and not df.empty:
+                        contracts[ccode] = {"K": K, "type": typ, "df": df, "month": mm}
+                    # 礼貌间隔，降低触发限流概率
+                    time.sleep(0.1)
+        if contracts:
+            opt_data[etf_code] = contracts
+            print(f"  [OK] ETF期权 {etf_code}: {len(contracts)} 合约")
+        else:
+            print(f"  [ERR] ETF期权 {etf_code}: 无数据")
+    return opt_data
+
+
+def _compute_synthetic_f(opt_data, etf_sheet_data):
+    """计算合成期货 F = K + (C - P)，逐日取最平值(ATM)合约对。返回 {etf_code: {date: F}}。"""
+    if not opt_data:
+        return {}
+
+    etf_close = {}  # etf_code -> {date: close}
+    for code, df in etf_sheet_data.items():
+        if df is not None and not df.empty:
+            for d, row in df.iterrows():
+                try:
+                    etf_close.setdefault(code, {})[str(d)] = float(row["close"])
+                except Exception:
+                    pass
+
+    # etf_code -> date -> month(YYMM) -> K -> {C:, P:}
+    # 增加 month 维度，便于强制只用「当月合约」算合成F（排除远月干扰）
+    by = {}
+    for etf_code, contracts in opt_data.items():
+        for ccode, info in contracts.items():
+            K, typ, df, mm = info["K"], info["type"], info["df"], info["month"]
+            for _, row in df.iterrows():
+                d = str(row["date"])
+                try:
+                    c = float(row["close"])
+                except Exception:
+                    continue
+                by.setdefault(etf_code, {}).setdefault(d, {}).setdefault(mm, {}).setdefault(K, {})[typ] = c
+
+    result = {}
+    for etf_code in opt_data:
+        result[etf_code] = {}
+        for d, mmap in by.get(etf_code, {}).items():
+            e = etf_close.get(etf_code, {}).get(d)
+            if e is None:
+                continue
+            # 当月 = 当天有报价合约中月份最小者（与期货近月逻辑一致）
+            # 不用自然月 YYMM 硬匹配：期权当月合约在到期后切换，自然月会错位导致缺口
+            yymm = min(mmap.keys())
+            kmap = mmap[yymm]
+            best, bestdiff = None, 1e18
+            for K, cp in kmap.items():
+                if "C" in cp and "P" in cp:
+                    diff = abs(K - e)
+                    if diff < bestdiff:
+                        bestdiff = diff
+                        best = K
+            if best is not None:
+                cp = kmap[best]
+                result[etf_code][d] = round(best + cp["C"] - cp["P"], 4)
+    return result
+
+
 def _third_friday(year, month):
     """返回指定年月的第三个周五（股指期货交割日）。"""
     first = date(year, month, 1)
@@ -592,8 +969,9 @@ def _get_third_fridays(start_str, end_str):
     return result
 
 
-def _compute_ratio_data(all_data, etf_sheet_data):
-    """计算所有品种当月合约的期货/ETF比率。返回 (ratio_data, dates)。"""
+def _compute_ratio_data(all_data, etf_sheet_data, synthetic_f=None):
+    """计算所有品种当月合约的 期货/ETF 与 期货/合成F 比率。
+    返回 (ratio_data, dates, ratio_data_sf)。synthetic_f 为 {etf_code:{date:F}}。"""
     etf_map = {
         "IH": "510050",
         "IF": "510300",
@@ -620,6 +998,13 @@ def _compute_ratio_data(all_data, etf_sheet_data):
                 except Exception:
                     pass
 
+    # 合成期货 F：date -> etf_code -> F
+    sf_by_date = {}
+    if synthetic_f:
+        for etf_code, dmap in synthetic_f.items():
+            for d, fv in dmap.items():
+                sf_by_date.setdefault(d, {})[etf_code] = fv
+
     # 预处理期货
     fut_by_inst_date = {}
     for code, df in all_data.items():
@@ -639,8 +1024,10 @@ def _compute_ratio_data(all_data, etf_sheet_data):
 
     # 算比率
     ratio_data = {}
+    ratio_data_sf = {}
     for d in all_fut_dates:
         ratio_data[d] = {}
+        ratio_data_sf[d] = {}
         for inst in INSTRUMENTS:
             contracts = fut_by_inst_date.get(inst, {}).get(d, [])
             if not contracts:
@@ -651,12 +1038,16 @@ def _compute_ratio_data(all_data, etf_sheet_data):
             e_close = etf_close.get(d, {}).get(etf_code)
             if e_close and e_close > 0:
                 ratio_data[d][inst] = round(front_close / e_close, 1)
+            # 期货/合成F
+            fv = sf_by_date.get(d, {}).get(etf_code)
+            if fv and fv > 0:
+                ratio_data_sf[d][inst] = round(front_close / fv, 1)
 
     dates = sorted(ratio_data.keys())
-    return ratio_data, dates
+    return ratio_data, dates, ratio_data_sf
 
 
-def _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date):
+def _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date, ratio_data_sf=None):
     """为单个品种构建「期货/ETF比率」sheet，含折线图 + 交割日标注。"""
     instr_names = {"IH": "上证50", "IF": "沪深300", "IC": "中证500", "IM": "中证1000"}
     chart_colors = {
@@ -668,6 +1059,9 @@ def _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date)
 
     ws = wb.create_sheet(title=f"{inst}_期货ETF比率")
     name = instr_names.get(inst, inst)
+
+    # 该品种是否有合成F数据（IM/512100 无期权行情 → 无，跳过期货/合成F列与图）
+    inst_has_sf = bool(ratio_data_sf) and any(inst in ratio_data_sf.get(d, {}) for d in dates)
 
     # ── 计算交割日（含假日顺延） ──
     delivery_dates = _get_third_fridays(start_date, end_date)
@@ -694,7 +1088,10 @@ def _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date)
     title_cell.alignment = Alignment(horizontal="center")
 
     # ── 表头 ──
-    for col, label in [(1, "日期"), (2, f"{inst} 期货/ETF")]:
+    headers = [(1, "日期"), (2, f"{inst} 期货/ETF")]
+    if inst_has_sf:
+        headers.append((3, f"{inst} 期货/合成F"))
+    for col, label in headers:
         cell = ws.cell(row=2, column=col, value=label)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
@@ -716,12 +1113,24 @@ def _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date)
         if inst in ratio_data[d]:
             cell.value = ratio_data[d][inst]
 
+        # 期货/合成F 列（仅该品种有合成F数据时填写）
+        if inst_has_sf:
+            cell3 = ws.cell(row=row_idx, column=3)
+            cell3.font = DATA_FONT
+            cell3.border = THIN_BORDER
+            cell3.alignment = Alignment(horizontal="right")
+            cell3.number_format = "0.0"
+            if inst in ratio_data_sf.get(d, {}):
+                cell3.value = ratio_data_sf[d][inst]
+
         if d in effective_delivery and inst in ratio_data[d]:
             delivery_idxs.append(row_idx - 3)
 
     # ── 列宽 ──
     ws.column_dimensions["A"].width = 12
     ws.column_dimensions["B"].width = 16
+    if inst_has_sf:
+        ws.column_dimensions["C"].width = 16
 
     # ── 折线图 ──
     chart = LineChart()
@@ -764,22 +1173,266 @@ def _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date)
     chart.legend.position = "b"
     ws.add_chart(chart, "D3")
 
+    # ── 第二折线图：期货/合成F（仅该品种有合成F数据时）──
+    if inst_has_sf:
+        chart2 = LineChart()
+        chart2.title = f"{inst} ({name}) 期货/合成F 比率"
+        chart2.style = 10
+        chart2.width = 26
+        chart2.height = 15
+        chart2.y_axis.title = "比率"
+
+        chart2.x_axis.tickLblSkip = 1
+        chart2.x_axis.tickMarkSkip = 1
+        chart2.x_axis.numFmt = "m/d"
+        chart2.x_axis.delete = False
+
+        cats2 = Reference(ws, min_col=1, min_row=3, max_row=2 + len(dates))
+        data_ref2 = Reference(ws, min_col=3, min_row=2, max_row=2 + len(dates))
+        chart2.add_data(data_ref2, titles_from_data=True)
+        chart2.set_categories(cats2)
+
+        s2 = chart2.series[0]
+        s2.graphicalProperties.line.width = 28000
+        if inst in chart_colors:
+            s2.graphicalProperties.line.solidFill = chart_colors[inst]
+
+        from openpyxl.chart.marker import Marker
+        color = chart_colors.get(inst, "4472C4")
+        s2.marker.symbol = "circle"
+        s2.marker.size = 4
+        s2.marker.graphicalProperties.solidFill = color
+
+        for idx in delivery_idxs:
+            pt = DataPoint(idx=idx)
+            m = Marker(symbol="circle", size=9)
+            m.graphicalProperties.solidFill = "FF0000"
+            pt.marker = m
+            s2.data_points.append(pt)
+
+        chart2.legend.position = "b"
+        ws.add_chart(chart2, "D20")
+
     return ws
 
 
-def build_ratio_chart_sheets(wb, all_data, etf_sheet_data, start_date, end_date):
-    """为四个品种各建一个「期货/ETF比率」sheet，每个含折线图。"""
-    ratio_data, dates = _compute_ratio_data(all_data, etf_sheet_data)
+def build_ratio_chart_sheets(wb, all_data, etf_sheet_data, start_date, end_date, synthetic_f=None):
+    """为四个品种各建一个「期货/ETF比率」sheet，每个含 期货/ETF 与 期货/合成F 折线图。"""
+    ratio_data, dates, ratio_data_sf = _compute_ratio_data(all_data, etf_sheet_data, synthetic_f)
     if not ratio_data:
         ws = wb.create_sheet(title="期货ETF比率")
         ws.cell(row=1, column=1, value="无数据")
         return {}
 
     for inst in INSTRUMENTS:
-        _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date)
+        _build_single_ratio_sheet(wb, ratio_data, dates, inst, start_date, end_date, ratio_data_sf=ratio_data_sf)
         print(f"  [OK] {inst}_期货ETF比率: {len(dates)} 个交易日, 图表已嵌入")
 
     return ratio_data
+
+
+def _rebuild_ratio_charts(ws, inst, has_sf, full_dates, delivery_idxs):
+    """清空并重建某比率 sheet 的折线图，引用范围扩展到 full_dates 长度。"""
+    from openpyxl.chart.marker import Marker
+
+    chart_colors = {"IH": "4472C4", "IF": "ED7D31", "IC": "70AD47", "IM": "FFC000"}
+    color = chart_colors.get(inst, "4472C4")
+    max_row = 2 + len(full_dates)
+
+    # 清空旧图（增量追加后行数变多，旧图范围已过期）
+    ws._charts = []
+
+    chart = LineChart()
+    chart.title = f"{inst} ({INSTRUMENT_NAMES.get(inst, inst)}) 期货/ETF 比率"
+    chart.style = 10
+    chart.width = 26
+    chart.height = 15
+    chart.y_axis.title = "比率"
+    chart.x_axis.tickLblSkip = 1
+    chart.x_axis.tickMarkSkip = 1
+    chart.x_axis.numFmt = "m/d"
+    chart.x_axis.delete = False
+    cats = Reference(ws, min_col=1, min_row=3, max_row=max_row)
+    data_ref = Reference(ws, min_col=2, min_row=2, max_row=max_row)
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats)
+    s = chart.series[0]
+    s.graphicalProperties.line.width = 28000
+    s.graphicalProperties.line.solidFill = color
+    s.marker.symbol = "circle"
+    s.marker.size = 4
+    s.marker.graphicalProperties.solidFill = color
+    for idx in delivery_idxs:
+        pt = DataPoint(idx=idx)
+        m = Marker(symbol="circle", size=9)
+        m.graphicalProperties.solidFill = "FF0000"
+        pt.marker = m
+        s.data_points.append(pt)
+    chart.legend.position = "b"
+    ws.add_chart(chart, "D3")
+
+    if has_sf:
+        chart2 = LineChart()
+        chart2.title = f"{inst} ({INSTRUMENT_NAMES.get(inst, inst)}) 期货/合成F 比率"
+        chart2.style = 10
+        chart2.width = 26
+        chart2.height = 15
+        chart2.y_axis.title = "比率"
+        chart2.x_axis.tickLblSkip = 1
+        chart2.x_axis.tickMarkSkip = 1
+        chart2.x_axis.numFmt = "m/d"
+        chart2.x_axis.delete = False
+        cats2 = Reference(ws, min_col=1, min_row=3, max_row=max_row)
+        data_ref2 = Reference(ws, min_col=3, min_row=2, max_row=max_row)
+        chart2.add_data(data_ref2, titles_from_data=True)
+        chart2.set_categories(cats2)
+        s2 = chart2.series[0]
+        s2.graphicalProperties.line.width = 28000
+        s2.graphicalProperties.line.solidFill = color
+        s2.marker.symbol = "circle"
+        s2.marker.size = 4
+        s2.marker.graphicalProperties.solidFill = color
+        for idx in delivery_idxs:
+            pt = DataPoint(idx=idx)
+            m = Marker(symbol="circle", size=9)
+            m.graphicalProperties.solidFill = "FF0000"
+            pt.marker = m
+            s2.data_points.append(pt)
+        chart2.legend.position = "b"
+        ws.add_chart(chart2, "D20")
+
+
+def _incremental_update(output_path, today_str):
+    """增量更新：读现有 xlsx，只补抓 last_date+1 ~ today 的新交易日，追加行并重建图表。
+    返回输出路径表示成功（含“已是最新”）；返回 None 表示无法增量，调用方应回退全量重算。"""
+    from openpyxl import load_workbook
+
+    if not os.path.exists(output_path):
+        return None
+
+    wb = load_workbook(output_path)
+
+    ratio_sheets = {
+        inst: wb[f"{inst}_期货ETF比率"]
+        for inst in INSTRUMENTS
+        if f"{inst}_期货ETF比率" in wb.sheetnames
+    }
+    if not ratio_sheets:
+        print("  [!] 现有文件无可增量更新的比率 sheet，转全量重算")
+        return None
+
+    # 读现有日期轴（取第一个 sheet 的 A 列，从 row3 起，连续非空）
+    first_ws = next(iter(ratio_sheets.values()))
+    existing_dates = []
+    r = 3
+    while True:
+        v = first_ws.cell(row=r, column=1).value
+        if v is None:
+            break
+        existing_dates.append(str(v))
+        r += 1
+    if not existing_dates:
+        print("  [!] 现有比率 sheet 无数据行，转全量重算")
+        return None
+
+    last_date = date.fromisoformat(existing_dates[-1])
+    new_start = last_date + timedelta(days=1)
+    if new_start > date.fromisoformat(today_str):
+        print(f"  [✓] 已是最新（末日 {existing_dates[-1]}），无需增量")
+        return output_path
+
+    print(f"\n📥 增量补抓 {new_start.isoformat()} ~ {today_str} ...")
+    contracts = discover_active_contracts(min_last_date=new_start.isoformat())
+    new_all = fetch_all_history(contracts, new_start.isoformat(), today_str)
+    _, new_etf = build_etf_sheet(Workbook(), new_start.isoformat(), today_str, create_sheet=False)
+
+    new_sf = {}
+    try:
+        opt = fetch_etf_option_history(new_start.isoformat(), today_str)
+        new_sf = _compute_synthetic_f(opt, new_etf)
+    except Exception as e:
+        print(f"  [!] 合成F增量失败，仅补 期货/ETF: {e}")
+
+    new_ratio, new_dates, new_ratio_sf = _compute_ratio_data(new_all, new_etf, new_sf)
+    if not new_dates:
+        print("  [✓] 新区间无期货交易日数据，无需增量")
+        return output_path
+
+    # 全量日期轴 + 交割日红点索引（覆盖现有+新，保证重建图表时旧红点不丢）
+    full_dates = existing_dates + new_dates
+    delivery_dates = _get_third_fridays(existing_dates[0], today_str)
+    dates_set = set(full_dates)
+    effective_delivery = set()
+    for dd in sorted(delivery_dates):
+        if dd in dates_set:
+            effective_delivery.add(dd)
+        else:
+            for off in range(1, 10):
+                cand = (date.fromisoformat(dd) + timedelta(days=off)).isoformat()
+                if cand in dates_set:
+                    effective_delivery.add(cand)
+                    break
+    delivery_idxs = [full_dates.index(d) for d in effective_delivery if d in full_dates]
+
+    base_row = 3 + len(existing_dates)
+    for inst, ws in ratio_sheets.items():
+        has_sf_col = ws.cell(row=2, column=3).value is not None
+        for i, d in enumerate(new_dates):
+            rr = base_row + i
+            c1 = ws.cell(row=rr, column=1, value=d)
+            c1.font = DATA_FONT
+            c1.border = THIN_BORDER
+            c1.alignment = Alignment(horizontal="center")
+            c2 = ws.cell(row=rr, column=2)
+            c2.font = DATA_FONT
+            c2.border = THIN_BORDER
+            c2.alignment = Alignment(horizontal="right")
+            c2.number_format = "0.0"
+            if inst in new_ratio.get(d, {}):
+                c2.value = new_ratio[d][inst]
+            if has_sf_col:
+                c3 = ws.cell(row=rr, column=3)
+                c3.font = DATA_FONT
+                c3.border = THIN_BORDER
+                c3.alignment = Alignment(horizontal="right")
+                c3.number_format = "0.0"
+                if inst in new_ratio_sf.get(d, {}):
+                    c3.value = new_ratio_sf[d][inst]
+        _rebuild_ratio_charts(ws, inst, has_sf_col, full_dates, delivery_idxs)
+
+    # 同步刷新 ETF收盘价 辅助 sheet（按新交易日追加）
+    if "ETF收盘价" in wb.sheetnames:
+        etf_ws = wb["ETF收盘价"]
+        ed = []
+        er = 3
+        while True:
+            v = etf_ws.cell(row=er, column=1).value
+            if v is None:
+                break
+            ed.append(str(v))
+            er += 1
+        ebase = 3 + len(ed)
+        etf_order = ["510050", "510300", "510500", "512100"]
+        for i, d in enumerate(new_dates):
+            rr = ebase + i
+            cc = etf_ws.cell(row=rr, column=1, value=d)
+            cc.font = DATA_FONT
+            cc.border = THIN_BORDER
+            cc.alignment = Alignment(horizontal="center")
+            for col, code in enumerate(etf_order, 2):
+                cell = etf_ws.cell(row=rr, column=col)
+                cell.font = DATA_FONT
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(horizontal="right")
+                if code in new_etf and d in new_etf[code].index:
+                    try:
+                        cell.value = round(float(new_etf[code].loc[d, "close"]), 3)
+                    except Exception:
+                        pass
+
+    wb.save(output_path)
+    print(f"  [✓] 增量完成：新增 {len(new_dates)} 个交易日（{new_dates[0]} ~ {new_dates[-1]}），已保存 {output_path}")
+    return output_path
 
 
 def main():
@@ -787,6 +1440,8 @@ def main():
     parser.add_argument("--start", default="2026-06-01", help="起始日期 YYYY-MM-DD")
     parser.add_argument("--end", default=date.today().isoformat(), help="结束日期 YYYY-MM-DD")
     parser.add_argument("--output", default=None, help="输出 Excel 文件路径")
+    parser.add_argument("--mode", default="auto", choices=["auto", "full", "incremental"],
+                        help="auto=文件存在则增量否则全量; full=全量重算; incremental=强制增量(文件须已存在)")
     args = parser.parse_args()
 
     start_date = args.start
@@ -796,6 +1451,19 @@ def main():
         print("❌ 需要 akshare，请先安装: pip install akshare")
         return 1
 
+    output_path = args.output or f"cffex_futures_{start_date}_{end_date}.xlsx"
+
+    # 增量分派：文件已存在时默认增量，避免每天把整张表全量重算一遍
+    if args.mode in ("auto", "incremental"):
+        if args.mode == "incremental" and not os.path.exists(output_path):
+            print("  [!] --mode incremental 但输出文件不存在，转全量重算")
+        elif os.path.exists(output_path):
+            res = _incremental_update(output_path, end_date)
+            if res is not None:
+                return res
+            print("  [!] 增量失败，回退全量重算")
+
+    # ===== 全量重算（首次 / --full / 增量不可用） =====
     print(f"\n📊 发现活跃合约...")
     contracts = discover_active_contracts(min_last_date=start_date)
     print(f"   共 {len(contracts)} 个合约: {', '.join(contracts)}\n")
@@ -807,12 +1475,6 @@ def main():
         print("❌ 没有任何数据")
         return 1
 
-    # 输出文件名
-    if args.output:
-        output_path = args.output
-    else:
-        output_path = f"cffex_futures_{start_date}_{end_date}.xlsx"
-
     print(f"\n📝 生成 Excel: {output_path}")
     wb = Workbook()
 
@@ -820,13 +1482,24 @@ def main():
     print(f"\n📥 拉取 ETF 数据...")
     _, etf_data = build_etf_sheet(wb, start_date, end_date, create_sheet=False)
 
+    # 合成期货 F = K + (C - P)（新浪原生 ETF 期权接口，逐日取最平值合约对）
+    print(f"\n📥 拉取 ETF 期权历史 + 计算合成期货 F...")
+    synthetic_f = {}
+    try:
+        opt_data = fetch_etf_option_history(start_date, end_date)
+        synthetic_f = _compute_synthetic_f(opt_data, etf_data)
+        n = sum(len(v) for v in synthetic_f.values())
+        print(f"   合成F覆盖: {n} 个 (etf_date) 数据点")
+    except Exception as e:
+        print(f"  [!] 合成F计算失败，仅生成 期货/ETF 列: {e}")
+
     # 删除默认空白 sheet
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
 
-    # 期货/ETF 比率图表（每个品种独立 sheet）
+    # 期货/ETF 比率图表（每个品种独立 sheet，含期货/合成F）
     print(f"\n📈 生成期货/ETF比率图表（每品种独立）...")
-    build_ratio_chart_sheets(wb, all_data, etf_data, start_date, end_date)
+    build_ratio_chart_sheets(wb, all_data, etf_data, start_date, end_date, synthetic_f=synthetic_f)
 
     wb.save(output_path)
     print(f"\n✅ 已保存: {output_path}")
