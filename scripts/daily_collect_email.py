@@ -79,45 +79,7 @@ EMAIL_CSS = """
 """
 
 
-def get_prev_close(code_map):
-    """
-    获取各品种当月合约的「昨收」（前一交易日收盘价），用于计算涨跌/涨跌幅。
-
-    来源：akshare futures_zh_daily_sina（新浪日线，仅读取历史收盘，符合只用 Sina 的约定）。
-    取 date < 今日 的最新一行收盘作为昨收。
-    返回 {instrument: 昨收(float)}；取不到时该品种不出现于字典。
-    """
-    prev = {}
-    try:
-        import akshare as ak
-        from datetime import date as _d
-        today_str = _d.today().strftime("%Y-%m-%d")
-        for inst, code in code_map.items():
-            try:
-                df = ak.futures_zh_daily_sina(symbol=code)
-                if df is None or getattr(df, "empty", True):
-                    continue
-                df = df.copy()
-                df["date"] = df["date"].astype(str)
-                prior = df[df["date"] < today_str]
-                if prior.empty:
-                    # 兜底：取倒数第二行（假设最后一行是今日）
-                    if len(df) >= 2:
-                        prior = df.iloc[[-2]]
-                    else:
-                        continue
-                row = prior.iloc[-1]
-                pc = row.get("close")
-                if pc is not None:
-                    try:
-                        prev[inst] = float(pc)
-                    except (TypeError, ValueError):
-                        pass
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return prev
+# （get_prev_close 已移除：当月昨收改由 fetch_all 结果的 preclose 字段直接提供，见 build_html_body）
 
 
 def _third_friday(year, month):
@@ -168,8 +130,13 @@ def build_html_body(results, etf_data, index_data=None):
         grouped.setdefault(r["instrument"], []).append(r)
 
     # 取各品种当月合约代码，用于查询「昨收」
-    code_map = {inst: grouped[inst][0]["code"] for inst in grouped if grouped.get(inst)}
-    prev_close = get_prev_close(code_map)
+    # 当月昨收直接取自 fetch_all 结果的 preclose 字段（Sina 实时 [13]，已验证=前一交易日收盘），
+    # 无需再发起独立请求。
+    prev_close = {
+        inst: grouped[inst][0].get("preclose")
+        for inst in grouped
+        if grouped.get(inst) and grouped[inst][0].get("preclose") is not None
+    }
 
     parts = [EMAIL_CSS]
     parts.append('<div class="container">')

@@ -5,8 +5,8 @@ CFFEX 股指期货收盘价获取脚本
 获取 IH(上证50)/IC(中证500)/IF(沪深300)/IM(中证1000) 所有活跃合约的收盘价。
 
 数据源：
-  主：akshare (futures_zh_daily_sina) — 返回结构化 DataFrame，含完整 OHLCV + settle
-  备：新浪 HTTP 直连 — 纯标准库，零外部依赖
+  唯一：新浪财经 HTTP 直连（hq.sinajs.cn CFF_RE_ 实时行情）
+  — 纯标准库 urllib，零外部依赖，与「统一 Sina 源」约定一致
 
 用法：
     python fetch_close_prices.py              # 获取最新数据，输出表格
@@ -74,150 +74,7 @@ def gen_contract_codes(year, month, months_ahead=CONTRACT_MONTHS_AHEAD):
     return codes
 
 
-# ── 数据获取：akshare 实时 ──────────────────────────────────────
-
-
-# akshare 实时接口品种名映射（中文品种名 → 代码前缀）
-AKSHARE_REALTIME_SYMBOLS = {
-    "IH": "上证50指数期货",
-    "IF": "沪深300指数期货",
-    "IC": "中证500指数期货",
-    "IM": "中证1000股指期货",
-}
-
-
-def _has_akshare():
-    """检查 akshare 是否可用。"""
-    try:
-        import akshare
-        return True
-    except ImportError:
-        return False
-
-
-def fetch_via_akshare_realtime():
-    """
-    通过 akshare futures_zh_realtime 获取各品种全部活跃合约的实时行情。
-
-    优点：返回当日数据（收盘后立即可取），一次拉一个品种所有合约。
-    限制：settlement 列在收盘后约 16:00 才有值，15:15 时为 0。
-
-    Returns:
-        list[dict]
-    """
-    import akshare as ak
-
-    results = []
-    for inst, cn_name in AKSHARE_REALTIME_SYMBOLS.items():
-        try:
-            df = ak.futures_zh_realtime(symbol=cn_name)
-            if df is None or df.empty:
-                continue
-
-            for _, row in df.iterrows():
-                symbol = str(row.get("symbol", ""))
-                # 过滤连续合约（如 IH0, IF0，长度<=4），它是当月合约镜像。
-                # 注意：不能用 symbol.endswith("0")，否则会把月份以 0 结尾的
-                # 合约（如 2610=10月、2710=10月）一并误删。
-                if len(symbol) <= 4:
-                    continue
-
-                code = symbol  # e.g. "IH2608"
-                month = code[2:]  # e.g. "2608"
-
-                close = _safe_float(row.get("close"))
-                volume = _safe_int(row.get("volume"))
-
-                # 过滤无效数据：仅丢弃无法定价的合约（close 缺失/为 0）。
-                # 注意：不要因 volume==0 丢弃——远季月/次月合约在盘前或成交清淡的
-                # 瞬时可能返回 volume=0，但它们有合法收盘价、属有效挂牌合约，
-                # 丢弃会导致"每品种 4 个合约"在某些时刻漏成 3 个。
-                if close is None or close == 0:
-                    continue
-
-                settle = _safe_float(row.get("settlement"))
-                # settlement 在收盘后不久为 0，用 presettlement 标记"待更新"
-                if settle is not None and settle == 0.0:
-                    settle = None
-
-                record = {
-                    "code": code,
-                    "instrument": inst,
-                    "month": month,
-                    "name": str(row.get("name", "")),
-                    "trade_date": str(row.get("tradedate", "")),
-                    "open": _safe_float(row.get("open")),
-                    "high": _safe_float(row.get("high")),
-                    "low": _safe_float(row.get("low")),
-                    "close": close,
-                    "preclose": _safe_float(row.get("preclose")),
-                    "volume": volume,
-                    "amount": None,
-                    "open_interest": _safe_int(row.get("position")),
-                    "settle": settle,
-                    "source": "akshare_realtime",
-                }
-
-                results.append(record)
-
-        except Exception as e:
-            print(f"[WARN] akshare realtime 获取 {inst} 失败: {e}", file=sys.stderr)
-
-    return results
-
-
-def fetch_via_akshare_daily(codes):
-    """
-    通过 akshare futures_zh_daily_sina 逐合约获取日线数据，取最新一条。
-
-    注意：此接口数据更新有延迟（收盘后 1-2 小时），15:15 时通常只有前一交易日数据。
-
-    Returns:
-        list[dict]
-    """
-    import akshare as ak
-
-    results = []
-    for code in codes:
-        try:
-            df = ak.futures_zh_daily_sina(symbol=code)
-
-            if df is None or (hasattr(df, "empty") and df.empty):
-                continue
-
-            row = df.iloc[-1]
-            record = {
-                "code": code,
-                "instrument": code[:2],
-                "month": code[2:],
-                "name": "",
-                "trade_date": str(row.get("date", "")),
-                "open": _safe_float(row.get("open")),
-                "high": _safe_float(row.get("high")),
-                "low": _safe_float(row.get("low")),
-                "close": _safe_float(row.get("close")),
-                "preclose": _safe_float(df.iloc[-2]["close"]) if len(df) > 1 else None,
-                "volume": _safe_int(row.get("volume")),
-                "amount": None,
-                "open_interest": _safe_int(row.get("hold")),
-                "settle": _safe_float(row.get("settle")),
-                "source": "akshare_daily",
-            }
-
-            # 仅丢弃无法定价的合约（close 缺失/为 0）；volume==0 的远月合约仍有
-            # 合法收盘价，属有效挂牌合约，不应因此丢弃（与 realtime/Sina 路径一致）。
-            if record["close"] is None or record["close"] == 0:
-                continue
-
-            results.append(record)
-
-        except ValueError:
-            continue
-        except Exception as e:
-            print(f"[WARN] akshare daily 获取 {code} 失败: {e}", file=sys.stderr)
-
-    return results
-
+# ── 数据获取：新浪 HTTP（实时主源，纯标准库 urllib，零外部依赖） ──────────
 
 # ── ETF 收盘价 ────────────────────────────────────────────────
 
@@ -330,7 +187,7 @@ def fetch_index_close():
     return idx_data
 
 
-# ── 数据获取：新浪 HTTP（备） ────────────────────────────────────
+# ── 数据获取：新浪 HTTP（实时主源，纯标准库） ──────────────────────────
 
 
 def fetch_via_sina(codes, batch_size=40):
@@ -355,18 +212,22 @@ def fetch_via_sina(codes, batch_size=40):
         batch = sina_codes[i : i + batch_size]
         url = SINA_URL + ",".join(batch)
 
-        try:
-            from urllib.request import Request, urlopen
-            from urllib.error import URLError
+        # Sina 实时接口偶发限流/网络抖动，重试最多 3 次（退避 1.5 秒）。
+        text = None
+        for attempt in range(3):
+            try:
+                from urllib.request import Request, urlopen
+                import time
 
-            req = Request(url, headers=SINA_HEADERS)
-            with urlopen(req, timeout=15) as resp:
-                text = resp.read().decode("gbk", errors="replace")
-        except URLError as e:
-            print(f"[WARN] 网络请求失败: {e}", file=sys.stderr)
-            continue
-        except Exception as e:
-            print(f"[WARN] 请求异常: {e}", file=sys.stderr)
+                req = Request(url, headers=SINA_HEADERS)
+                with urlopen(req, timeout=15) as resp:
+                    text = resp.read().decode("gbk", errors="replace")
+                break
+            except Exception as e:
+                print(f"[WARN] Sina 实时请求第 {attempt + 1} 次失败: {e}", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(1.5)
+        if text is None:
             continue
 
         for m in re.finditer(r'var hq_str_(\w+)="([^"]*)"', text):
@@ -418,54 +279,18 @@ def fetch_via_sina(codes, batch_size=40):
 
 
 def fetch_all():
-    """获取所有活跃合约数据。优先级：akshare realtime → Sina HTTP → akshare daily。"""
-    # 第一优先：akshare realtime（实时行情，收盘后立即可取，一次拉整个品种）
-    results = []
-    if _has_akshare():
-        results = fetch_via_akshare_realtime()
+    """获取所有活跃合约数据（纯 Sina 实时接口，零 akshare 依赖）。"""
+    today = date.today()
+    codes = gen_contract_codes(today.year, today.month)
+    pm = today.month - 1
+    py = today.year
+    if pm <= 0:
+        pm = 12
+        py -= 1
+    codes.extend(gen_contract_codes(py, pm, 1))
+    codes = list(dict.fromkeys(codes))
 
-    # 检查是否有品种缺失（可能是 close=0 被过滤或数据源延迟）
-    present_insts = {r["instrument"] for r in results}
-    missing_insts = [inst for inst in INSTRUMENTS if inst not in present_insts]
-
-    # 第二优先：Sina HTTP 补充（无数据或有品种缺失时触发）
-    if missing_insts or not results:
-        today = date.today()
-        codes = gen_contract_codes(today.year, today.month)
-        pm = today.month - 1
-        py = today.year
-        if pm <= 0:
-            pm = 12
-            py -= 1
-        codes.extend(gen_contract_codes(py, pm, 1))
-        codes = list(dict.fromkeys(codes))
-
-        if not results:
-            print("[INFO] akshare realtime 无数据，回退到 Sina HTTP", file=sys.stderr)
-        else:
-            print(f"[INFO] akshare realtime 缺少品种 {missing_insts}，用 Sina HTTP 补充", file=sys.stderr)
-
-        sina_results = fetch_via_sina(codes)
-        # 合并：只添加 results 中不存在的合约
-        existing_codes = {r["code"] for r in results}
-        for r in sina_results:
-            if r["code"] not in existing_codes:
-                results.append(r)
-
-    # 第三优先：akshare daily（延迟数据，收盘后 1-2 小时才有）
-    if not results and _has_akshare():
-        today = date.today()
-        codes = gen_contract_codes(today.year, today.month)
-        pm = today.month - 1
-        py = today.year
-        if pm <= 0:
-            pm = 12
-            py -= 1
-        codes.extend(gen_contract_codes(py, pm, 1))
-        codes = list(dict.fromkeys(codes))
-
-        print("[INFO] akshare realtime 和 Sina HTTP 均无数据，回退到 akshare daily", file=sys.stderr)
-        results = fetch_via_akshare_daily(codes)
+    results = fetch_via_sina(codes)
 
     # 去重
     seen = set()
@@ -525,7 +350,7 @@ def format_table(results, etf_data=None):
 
     # 数据源标记
     src = results[0].get("source", "") if results else ""
-    src_label = "akshare 实时" if src == "akshare_realtime" else ("akshare 日线" if src == "akshare_daily" else "新浪 HTTP")
+    src_label = "新浪 HTTP"
 
     grouped = {}
     for r in results:
