@@ -264,7 +264,7 @@ def format_html(results, etf_data):
             html += f"<tr><td><b>{inst}</b></td><td>{front:.1f}</td><td>{last:.1f}</td><td>{color_num(diff, with_sign=True)}</td><td>{color_num(pct, with_sign=True)}%</td></tr>\n"
 
     html += "</table>\n"
-    html += '<p class="note">数据来源: akshare · 每日自动生成 · 公众号草稿箱</p>\n'
+    html += '<p class="note">数据来源: 新浪财经 · 每日自动生成 · 公众号草稿箱</p>\n'
 
     return html, trade_date
 
