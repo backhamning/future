@@ -341,7 +341,11 @@ def fetch_via_sina(codes, batch_size=40):
       [0] 今开  [1] 最高  [2] 最低  [3] 收盘  [4] 成交量
       [5] 成交额 [6] 持仓量
       [13] 昨收（与 Sina 日线前一交易日收盘一致，已多合约验证）
-      [36] 日期 [37] 时间  [48] 结算价  [49] 名称
+      [14] 昨结算（与 akshare presettlement 一致）
+      [36] 日期 [37] 时间
+      [48] 待定（实测 ≠ CFFEX 结算价，例如 IF2609 官方结算价 4592.4，
+            而 Sina [48]=4601.116，故 [48] 非结算价；盘后实时源均取不到真实结算价）
+      [49] 名称
     """
     # Sina 需要 CFF_RE_ 前缀
     sina_codes = [f"CFF_RE_{c}" for c in codes]
@@ -397,7 +401,9 @@ def fetch_via_sina(codes, batch_size=40):
                     "volume": volume,
                     "amount": _safe_float(vals[5]),
                     "open_interest": _safe_int(vals[6]),
-                    "settle": _safe_float(vals[48]) if len(vals) > 48 else None,
+                    # 注意：Sina [48] 经实测并非结算价（IF2609 Sina[48]=4601.116 ≠ CFFEX 官方 4592.4）；
+                    # 且盘后 akshare 实时 settlement 字段亦为 0（未回填）。故新浪兜底路径不提供可靠结算价。
+                    "settle": None,
                     "preclose": _safe_float(vals[13]) if len(vals) > 13 else None,
                     "source": "sina_http",
                 }
