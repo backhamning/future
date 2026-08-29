@@ -337,9 +337,10 @@ def fetch_via_sina(codes, batch_size=40):
     """
     从新浪财经 HTTP 批量获取期货行情。
 
-    字段映射（已验证）：
+    字段映射（已实测核对，2026-08-29）：
       [0] 今开  [1] 最高  [2] 最低  [3] 收盘  [4] 成交量
       [5] 成交额 [6] 持仓量
+      [13] 昨收（与 Sina 日线前一交易日收盘一致，已多合约验证）
       [36] 日期 [37] 时间  [48] 结算价  [49] 名称
     """
     # Sina 需要 CFF_RE_ 前缀
@@ -397,7 +398,7 @@ def fetch_via_sina(codes, batch_size=40):
                     "amount": _safe_float(vals[5]),
                     "open_interest": _safe_int(vals[6]),
                     "settle": _safe_float(vals[48]) if len(vals) > 48 else None,
-                    "preclose": None,
+                    "preclose": _safe_float(vals[13]) if len(vals) > 13 else None,
                     "source": "sina_http",
                 }
                 results.append(record)
