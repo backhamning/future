@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fetch_close_prices import (
     fetch_all,
     fetch_etf_close,
+    fetch_index_close,
     save_excel,
     INSTRUMENTS,
     INSTRUMENT_NAMES,
@@ -45,16 +46,19 @@ EMAIL_CSS = """
   .subtitle { font-size: 13px; color: #999; margin-bottom: 16px; }
 
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { background: #f0f2f5; color: #555; font-weight: 600; text-align: right;
+  th { color: #555; font-weight: 600; text-align: right;
        padding: 8px 10px; border-bottom: 2px solid #e0e0e0; white-space: nowrap; }
   th:first-child, th.col-left { text-align: left; }
   td { padding: 7px 10px; text-align: right; border-bottom: 1px solid #f0f0f0; }
   td:first-child, td.col-left { text-align: left; font-weight: 500; }
 
+  /* 单元格底色用 bgcolor HTML 属性（邮件客户端唯一稳妥方式），CSS 不设背景 */
+  .col-calc { white-space: nowrap; }
+
   .up   { color: #e74c3c; font-weight: 600; }
   .down { color: #27ae60; font-weight: 600; }
   .muted { color: #bbb; }
-  .highlight { background: #fff9e6; font-weight: 700; }
+  .highlight { font-weight: 700; }
   .highlight td { border-bottom-color: #f5e6b0; }
 
   .summary-table td { font-size: 15px; padding: 10px 10px; }
@@ -142,7 +146,7 @@ def days_between_deliveries(front_month, far_month):
         return None
 
 
-def build_html_body(results, etf_data):
+def build_html_body(results, etf_data, index_data=None):
     """生成 HTML 邮件正文。"""
     if not results:
         return "<p style='color:#999;text-align:center;padding:40px'>今日无数据（可能为非交易日或网络异常）</p>"
@@ -154,8 +158,10 @@ def build_html_body(results, etf_data):
         dt = datetime.strptime(trade_date, "%Y-%m-%d")
         wd = weekday[dt.weekday()]
         date_display = f"{trade_date} {wd}"
+        trade_date_date = dt.date()
     except ValueError:
         date_display = trade_date
+        trade_date_date = None
 
     grouped = {}
     for r in results:
@@ -175,9 +181,15 @@ def build_html_body(results, etf_data):
 
     # ── 概览表 ──
     parts.append('<table class="summary-table">'
-                 '<tr><th class="col-left">品种</th><th>当月合约</th><th>收盘</th>'
-                 '<th>涨跌 / 涨跌幅</th><th>期货/ETF</th><th>价差结构</th>'
-                 '<th>贴水率</th><th>年化贴水率</th></tr>')
+                 '<tr>'
+                 '<th class="col-left" bgcolor="#f0f2f5">品种</th>'
+                 '<th bgcolor="#f0f2f5">当月合约</th>'
+                 '<th bgcolor="#f0f2f5">收盘</th>'
+                 '<th bgcolor="#f0f2f5">涨跌 / 涨跌幅</th>'
+                 '<th bgcolor="#f0f2f5">期货/ETF</th>'
+                 '<th bgcolor="#f0f2f5">价差结构</th>'
+                 '<th bgcolor="#f0f2f5">贴水率</th>'
+                 '<th bgcolor="#f0f2f5">年化贴水率</th></tr>')
 
     for inst in ["IH", "IF", "IC", "IM"]:
         if inst not in grouped:
@@ -260,14 +272,14 @@ def build_html_body(results, etf_data):
 
         parts.append(
             f'<tr>'
-            f'<td class="col-left inst-name">{inst}</td>'
-            f'<td class="col-left">{name} <span class="tag tag-front">{month_label}</span></td>'
-            f'<td>{cls}</td>'
-            f'<td class="{chg_cls}">{chg_sign}</td>'
-            f'<td class="ratio-val">{ratio_str}</td>'
-            f'<td class="{structure_cls}">{structure_str}</td>'
-            f'<td class="{rate_cls}">{disc_str}</td>'
-            f'<td class="{rate_cls}">{ann_str}</td>'
+            f'<td class="col-left inst-name" bgcolor="#ffffff">{inst}</td>'
+            f'<td class="col-left" bgcolor="#ffffff">{name} <span class="tag tag-front">{month_label}</span></td>'
+            f'<td bgcolor="#ffffff">{cls}</td>'
+            f'<td class="{chg_cls}" bgcolor="#ffffff">{chg_sign}</td>'
+            f'<td class="ratio-val" bgcolor="#ffffff">{ratio_str}</td>'
+            f'<td class="{structure_cls}" bgcolor="#ffffff">{structure_str}</td>'
+            f'<td class="{rate_cls}" bgcolor="#ffffff">{disc_str}</td>'
+            f'<td class="{rate_cls}" bgcolor="#ffffff">{ann_str}</td>'
             f'</tr>'
         )
 
@@ -305,18 +317,24 @@ def build_html_body(results, etf_data):
         parts.append(f'<div class="card">'
                      f'<div class="section-title">{inst} — {name}{etf_info}</div>'
                      f'<table>'
-                     f'<tr><th class="col-left">合约</th><th>今开</th><th>最高</th><th>最低</th>'
-                     f'<th>收盘</th><th>结算</th><th>价差</th><th>期货/ETF</th>'
-                     f'<th>成交量</th><th>持仓量</th></tr>')
+                     f'<tr>'
+                     f'<th class="col-left" bgcolor="#f0f2f5">合约</th>'
+                     f'<th bgcolor="#f0f2f5">今开</th>'
+                     f'<th bgcolor="#f0f2f5">昨收</th>'
+                     f'<th bgcolor="#f0f2f5">收盘</th>'
+                     f'<th bgcolor="#f0f2f5">价差</th>'
+                     f'<th bgcolor="#f0f2f5">期货/ETF</th>'
+                     f'<th bgcolor="#f0f2f5">成交量</th>'
+                     f'<th bgcolor="#f0f2f5">持仓量</th>'
+                     f'<th class="col-calc" bgcolor="#f0f2f5">基差率</th>'
+                     f'<th class="col-calc" bgcolor="#f0f2f5">跨期率</th></tr>')
 
         for i, r in enumerate(contracts):
             month = r["month"]
 
             o = fmt_f(r["open"])
-            h = fmt_f(r["high"])
-            l = fmt_f(r["low"])
+            pc = fmt_f(r["preclose"])
             c = fmt_f(r["close"])
-            s = fmt_f(r["settle"])
             v = fmt_i(r["volume"])
             oi = fmt_i(r["open_interest"])
 
@@ -337,15 +355,49 @@ def build_html_body(results, etf_data):
                 ratio_str = '<span class="muted">--</span>'
 
             row_class = "highlight" if i == 0 else ""
+            row_bg = "#fff9e6" if i == 0 else "#ffffff"
+
+            # 持仓量右侧两列：基差率 / 跨期率。第 1 行（当月）留空。
+            basis_cell = '<span class="muted">--</span>'
+            cross_cell = '<span class="muted">--</span>'
+            if i > 0:
+                r_close = r["close"]
+                spot = index_data.get(inst) if index_data else None
+                # 基差率 = (合约 − 现货) / 现货 × 365 / 距交割天数；正 = 升水、负 = 贴水
+                if spot and spot > 0 and r_close is not None and trade_date_date is not None:
+                    d_basis = (_delivery_date(r["month"]) - trade_date_date).days
+                    if d_basis and d_basis > 0:
+                        b_ann = (r_close - spot) / spot * 100 * 365.0 / d_basis
+                        if b_ann > 0.005:
+                            basis_cell = f'<span class="up">+{b_ann:.2f}%</span>'
+                        elif b_ann < -0.005:
+                            basis_cell = f'<span class="down">-{abs(b_ann):.2f}%</span>'
+                        else:
+                            basis_cell = "0.00%"
+                # 跨期率 = (合约 − 当月) / 当月 × 365 / 两合约交割间隔天数
+                if front_close and front_close > 0 and r_close is not None:
+                    d_cross = days_between_deliveries(r["month"], contracts[0]["month"])
+                    if d_cross and d_cross > 0:
+                        c_ann = (r_close - front_close) / front_close * 100 * 365.0 / d_cross
+                        if c_ann > 0.005:
+                            cross_cell = f'<span class="up">+{c_ann:.2f}%</span>'
+                        elif c_ann < -0.005:
+                            cross_cell = f'<span class="down">-{abs(c_ann):.2f}%</span>'
+                        else:
+                            cross_cell = "0.00%"
 
             parts.append(
                 f'<tr class="{row_class}">'
-                f'<td class="col-left">{month}</td>'
-                f'<td>{o}</td><td>{h}</td><td>{l}</td>'
-                f'<td>{c}</td><td>{s}</td>'
-                f'<td>{spread}</td>'
-                f'<td><b>{ratio_str}</b></td>'
-                f'<td>{v}</td><td>{oi}</td>'
+                f'<td class="col-left" bgcolor="{row_bg}">{month}</td>'
+                f'<td bgcolor="{row_bg}">{o}</td>'
+                f'<td bgcolor="{row_bg}">{pc}</td>'
+                f'<td bgcolor="{row_bg}">{c}</td>'
+                f'<td bgcolor="{row_bg}">{spread}</td>'
+                f'<td bgcolor="{row_bg}"><b>{ratio_str}</b></td>'
+                f'<td bgcolor="{row_bg}">{v}</td>'
+                f'<td bgcolor="{row_bg}">{oi}</td>'
+                f'<td class="col-calc" bgcolor="{row_bg}">{basis_cell}</td>'
+                f'<td class="col-calc" bgcolor="{row_bg}">{cross_cell}</td>'
                 f'</tr>'
             )
 
@@ -359,9 +411,9 @@ def build_html_body(results, etf_data):
     return "\n".join(parts)
 
 
-def build_email_body(results, etf_data):
+def build_email_body(results, etf_data, index_data=None):
     """生成邮件正文（HTML 格式）。"""
-    return build_html_body(results, etf_data)
+    return build_html_body(results, etf_data, index_data)
 
 
 def send_email(subject, html_body):
@@ -415,6 +467,10 @@ def main():
     etf_data = fetch_etf_close()
     print(f"      获取到 {len(etf_data)} 只 ETF")
 
+    print("[2b] 获取现货指数数据...")
+    index_data = fetch_index_close()
+    print(f"      获取到 {len(index_data)} 个指数")
+
     # 保存 Excel
     if excel_file:
         fp = save_excel(results, etf_data, excel_file)
@@ -423,7 +479,7 @@ def main():
 
     # 2. 格式化邮件
     print("\n[3/4] 格式化邮件...")
-    body = build_email_body(results, etf_data)
+    body = build_email_body(results, etf_data, index_data)
 
     # 控制台摘要（不打印完整 HTML）
     for inst in ["IH", "IF", "IC", "IM"]:

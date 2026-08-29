@@ -150,6 +150,7 @@ def fetch_via_akshare_realtime():
                     "high": _safe_float(row.get("high")),
                     "low": _safe_float(row.get("low")),
                     "close": close,
+                    "preclose": _safe_float(row.get("preclose")),
                     "volume": volume,
                     "amount": None,
                     "open_interest": _safe_int(row.get("position")),
@@ -195,6 +196,7 @@ def fetch_via_akshare_daily(codes):
                 "high": _safe_float(row.get("high")),
                 "low": _safe_float(row.get("low")),
                 "close": _safe_float(row.get("close")),
+                "preclose": _safe_float(df.iloc[-2]["close"]) if len(df) > 1 else None,
                 "volume": _safe_int(row.get("volume")),
                 "amount": None,
                 "open_interest": _safe_int(row.get("hold")),
@@ -279,6 +281,55 @@ def fetch_etf_close():
     return etf_data
 
 
+def fetch_index_close():
+    """
+    获取 IH/IF/IC/IM 对应现货指数（上证50/沪深300/中证500/中证1000）的最新收盘点位。
+
+    仅用 Sina HTTP（与 fetch_etf_close 一致，零外部依赖，便于 GitHub Actions 运行）。
+    返回 {instrument: close(float)}；取不到的品种不出现于字典。
+    """
+    sina_map = {
+        "IH": "sh000016",   # 上证50指数
+        "IF": "sh000300",   # 沪深300指数
+        "IC": "sh000905",   # 中证500指数
+        "IM": "sh000852",   # 中证1000指数
+    }
+    from urllib.request import Request, urlopen
+    import time
+
+    url = SINA_URL + ",".join(sina_map.values())
+    rev = {v: k for k, v in sina_map.items()}
+    idx_data = {}
+
+    # 与 ETF 同样：Sina 实时接口偶发限流，重试最多 3 次（间隔 2 秒），集齐 4 个才收手。
+    for attempt in range(3):
+        try:
+            req = Request(url, headers=SINA_HEADERS)
+            with urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("gbk", errors="replace")
+            for m in re.finditer(r'var hq_str_(\w+)="([^"]*)"', text):
+                sina_code = m.group(1)
+                vals = m.group(2).split(",")
+                if sina_code not in rev or len(vals) < 4:
+                    continue
+                inst = rev[sina_code]
+                # Sina 指数行情：vals[0]=名称, vals[1]=当前点位(收盘)
+                close_str = vals[1].strip()
+                if close_str:
+                    try:
+                        idx_data[inst] = float(close_str)
+                    except ValueError:
+                        pass
+            if len(idx_data) >= len(sina_map):
+                break
+        except Exception as e:
+            print(f"[WARN] 指数实时获取第 {attempt + 1} 次失败: {e}", file=sys.stderr)
+        if attempt < 2:
+            time.sleep(2)
+
+    return idx_data
+
+
 # ── 数据获取：新浪 HTTP（备） ────────────────────────────────────
 
 
@@ -346,6 +397,7 @@ def fetch_via_sina(codes, batch_size=40):
                     "amount": _safe_float(vals[5]),
                     "open_interest": _safe_int(vals[6]),
                     "settle": _safe_float(vals[48]) if len(vals) > 48 else None,
+                    "preclose": None,
                     "source": "sina_http",
                 }
                 results.append(record)
