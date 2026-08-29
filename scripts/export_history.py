@@ -68,14 +68,6 @@ def _safe_int(val):
         return None
 
 
-def _has_akshare():
-    try:
-        import akshare  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 def gen_monthly_contracts(year, month, count):
     """生成连续月份合约代码（如 IH2608）。"""
     codes = []
@@ -175,10 +167,7 @@ def discover_active_contracts(min_last_date=None):
 
 def fetch_all_history(contracts, start_date, end_date):
     """拉取所有合约在日期范围内的日线数据（含当日实时补丁）。"""
-    import akshare as ak
     import pandas as pd
-
-    RT_SYMBOLS = {"IH": "上证50指数期货", "IF": "沪深300指数期货", "IC": "中证500指数期货", "IM": "中证1000股指期货"}
 
     all_data = {}  # {contract_code: DataFrame}
     for code in contracts:
@@ -199,54 +188,42 @@ def fetch_all_history(contracts, start_date, end_date):
         except Exception as e:
             print(f"  [ERR] {code}: {e}")
 
-    # 补充当日数据：futures_zh_daily_sina 延迟 1-2 小时且对部分新合约（如 2609/2610）
-    # 会直接抛 IndexError，日线不可用；故用 realtime 补当日。
-    # 注意：日线失败的合约即使 realtime 有当日数据也必须补（新建记录），
+    # 补充当日数据：新浪日 K 线接口在收盘后 1-2 小时内对部分新合约（如 2609/2610）
+    # 暂未回填当日，故用 CFF_RE_ 实时接口补当日（与 fetch_close_prices 同一数据源，零 akshare）。
+    # 注意：日线失败的合约即使实时有当日数据也必须补（新建记录），
     # 否则"当月"合约（如 IC2609/IM2609）缺失会导致期货/ETF 比率错用远月。
     try:
-        for inst, cn_name in RT_SYMBOLS.items():
-            try:
-                rt = ak.futures_zh_realtime(symbol=cn_name)
-                if rt is None or rt.empty:
+        from fetch_close_prices import fetch_all
+        for r in fetch_all():
+            code = r["code"]
+            trade_date = r.get("trade_date", "")
+            close_v = r.get("close")
+            volume_v = r.get("volume")
+            if not trade_date or close_v is None or volume_v is None or volume_v == 0:
+                continue
+
+            new_row = pd.DataFrame([{
+                "date": trade_date,
+                "open": r.get("open"),
+                "high": r.get("high"),
+                "low": r.get("low"),
+                "close": close_v,
+                "volume": volume_v,
+                "hold": r.get("open_interest"),
+                "settle": r.get("settle"),
+            }])
+
+            if code in all_data:
+                existing_dates = set(all_data[code]["date"].values)
+                if trade_date in existing_dates:
                     continue
-                for _, row in rt.iterrows():
-                    symbol = str(row.get("symbol", ""))
-                    # 过滤连续合约（如 IH0，长度<=4）；不能用 endswith("0")，
-                    # 否则月份以 0 结尾的合约（如 2610=10月）会被误删。
-                    if len(symbol) <= 4:
-                        continue
-                    trade_date = str(row.get("tradedate", ""))
-                    if not trade_date:
-                        continue
-                    close_v = _safe_float(row.get("close"))
-                    volume_v = _safe_int(row.get("volume"))
-                    if close_v is None or volume_v is None or volume_v == 0:
-                        continue
-
-                    new_row = pd.DataFrame([{
-                        "date": trade_date,
-                        "open": _safe_float(row.get("open")),
-                        "high": _safe_float(row.get("high")),
-                        "low": _safe_float(row.get("low")),
-                        "close": close_v,
-                        "volume": volume_v,
-                        "hold": _safe_int(row.get("position")),
-                        "settle": _safe_float(row.get("settlement")),
-                    }])
-
-                    if symbol in all_data:
-                        existing_dates = set(all_data[symbol]["date"].values)
-                        if trade_date in existing_dates:
-                            continue
-                        all_data[symbol] = pd.concat([all_data[symbol], new_row], ignore_index=True)
-                    else:
-                        # 日线缺失的新合约：用 realtime 当日数据新建
-                        all_data[symbol] = new_row
-                    print(f"  [+] {symbol}: 补充当日 {trade_date} (realtime)")
-            except Exception:
-                pass
-    except Exception:
-        pass
+                all_data[code] = pd.concat([all_data[code], new_row], ignore_index=True)
+            else:
+                # 日线缺失的新合约：用实时当日数据新建
+                all_data[code] = new_row
+            print(f"  [+] {code}: 补充当日 {trade_date} (Sina realtime)")
+    except Exception as e:
+        print(f"  [!] 当日 Sina 实时补充失败: {e}")
 
     return all_data
 
@@ -1446,10 +1423,6 @@ def main():
 
     start_date = args.start
     end_date = args.end
-
-    if not _has_akshare():
-        print("❌ 需要 akshare，请先安装: pip install akshare")
-        return 1
 
     output_path = args.output or f"cffex_futures_{start_date}_{end_date}.xlsx"
 
